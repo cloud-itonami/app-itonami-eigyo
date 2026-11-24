@@ -13,11 +13,20 @@
   // (not exposed as a route). D1/KV/DO/secrets are allowed by the policy
   // but are NOT created here — the EIGYO_DB binding below is a free-tier
   // placeholder (all-zero id; NOT created, mirrors schema.sql);
-  // src/worker.js uses env.EIGYO_DB for sealed_records when the binding
-  // is present and holds sealed envelopes in a marked DEMO fallback when
-  // it is absent.
+  // src/worker.js uses env.EIGYO_DB for sealed_records + auth tables
+  // (challenges/sessions, hash-only) and answers 503 when it is absent
+  // (never an in-memory fallback).
   // No paid resources.
   "d1_databases": [
     { "binding": "EIGYO_DB", "database_name": "app-itonami-eigyo", "database_id": "00000000-0000-0000-0000-000000000000" }
+  ],
+  // Challenge-issuance throttling: Cloudflare Rate Limiting binding keyed
+  // by client IP (src/worker.js calls AUTH_RATE_LIMIT.limit({key: ip});
+  // the IP is never stored in D1). Config only — nothing is deployed by
+  // this change. Without the binding the Worker logs the absence and
+  // applies no limit. DID counting is deliberately NOT used (a DID is
+  // public; counting it would let a third party lock out its owner).
+  "ratelimit": [
+    { "name": "AUTH_RATE_LIMIT", "namespace": "eigyo-auth-challenge", "simple": { "limit": 100, "period": 60 } }
   ]
 }

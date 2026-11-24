@@ -232,8 +232,8 @@ real D1 database (wrangler keeps the zero-UUID placeholder), **no
 ### 11.2 Auth — Awai identity `did:key` (`src/auth.js`, `src/worker.js`)
 
 ```text
-POST /auth/challenge {did}           -> 201 {did, nonce, purpose, timestamp, expiresAt} | 400 invalid-did
-POST /auth/verify {did, nonce, signature} -> 200 {session, did, expiresAt} | 401 auth-failed
+POST /auth/challenge {did}           -> 201 {did, nonce, purpose, timestamp, expiresAt} | 400 invalid-did | 429 rate-limited (AUTH_RATE_LIMIT binding) | 503 store-unavailable
+POST /auth/verify {did, nonce, signature} -> 200 {session, did, expiresAt} | 401 auth-failed | 503 store-unavailable
 ```
 
 - `did:key:z<base58btc multicodec ed25519-pubkey>` (prefix bytes `ed 01`).
@@ -244,12 +244,35 @@ POST /auth/verify {did, nonce, signature} -> 200 {session, did, expiresAt} | 401
   **5 minutes**; sessions are **5-minute** DID-bound sessions presented
   via `x-did` + `x-session` headers (owner decision: no Bearer, same as
   kokyaku; review #5). The session is bound to the presented DID — a
-  mismatched `x-did` answers 401. Sessions are held in Worker memory in
-  this skeleton — if an isolate restarts, clients simply re-authenticate
-  (a new challenge/verify). There is no Worker secret for key material.
-  TODO (item 8, out of scope this PR): nonces/sessions are isolate-local
-  `Map`s; moving them to D1/DO with an expiry sweep is pre-deploy work
-  for a separate PR.
+  mismatched `x-did` answers 401. Nonces and sessions are stored in
+  **D1** (`env.EIGYO_DB`, tables `challenges` / `sessions`,
+  `schema.sql`) — never in isolate-local memory — so any isolate can
+  verify. Both tables are **hash-only**: `nonce_hash` / `session_hash`
+  hold the SHA-256 hex of the raw value; raw nonces/sessions exist only
+  in the challenge/verify responses and are never written to D1.
+  Single-use is enforced by one atomic SQL claim —
+  `UPDATE challenges SET used = 1 WHERE nonce_hash = ? AND used = 0 AND
+  expires_at > ?` — and verify proceeds only when `meta.changes === 1`;
+  the claim runs **before** signature verification, so a failed verify
+  (bad signature, wrong DID) burns the nonce too, and two parallel
+  verifies of the same signature yield exactly one session. Expired
+  challenges/sessions are deleted by a sweep on both the challenge and
+  verify paths; tables beyond **10,000 rows** are trimmed oldest-first
+  by the same sweep (growth is cleaned up, never rejected).
+  Unauthenticated challenge issuance is throttled by the
+  **`AUTH_RATE_LIMIT` Cloudflare Rate Limiting binding keyed by client
+  IP** (`wrangler.jsonc` `ratelimit`, config only — not deployed; the
+  IP is never stored in D1). The key is **`cf-connecting-ip` only** —
+  `x-forwarded-for` is spoofable and is never used; with no
+  `cf-connecting-ip` the binding is not called at all (no limit,
+  logged). DID-based issuance caps were **removed**:
+  a DID is public, so counting it would let a third party lock out its
+  owner (and disposable DIDs would lock out everyone). With the binding
+  present its decision is passed through as-is; with no binding the
+  Worker logs the absence and applies no limit. NO `EIGYO_DB` binding
+  → **503** `store-unavailable` on all auth/records routes — the Worker
+  never falls back to memory storage. There is no Worker secret for key
+  material.
 - **Ed25519 choice:** WebCrypto only (`crypto.subtle` Ed25519
   importKey/sign/verify, ~0.05 ms/verify). The former pure-JS BigInt
   implementation is **deleted** (review #4): it measured ~143 ms/verify,
@@ -266,20 +289,37 @@ POST /auth/verify {did, nonce, signature} -> 200 {session, did, expiresAt} | 401
 - Private keys, passphrases and KEKs **never** reach the Worker — there is
   no Worker secret, log line, or route for them (negative control e).
 
-### 11.3 Storage — D1 `sealed_records` only
+### 11.3 Storage — D1 `sealed_records` + auth tables (no memory fallback)
 
-`schema.sql` is exactly:
+`schema.sql` holds `sealed_records` **plus** the auth tables
+(`challenges`, `sessions`, `owner_seq_counters`). `sealed_records` is
+exactly:
 
 ```sql
-CREATE TABLE sealed_records (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, cid TEXT, envelope TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE sealed_records (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, cid TEXT, envelope TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(owner_id, seq));
 CREATE INDEX idx_sealed_owner ON sealed_records(owner_id);
 ```
 
+The `UNIQUE(owner_id, seq)` constraint is the backstop for the counter
+below: a colliding insert is **retried with a fresh allocation**
+(up to 3 attempts) instead of failing the write; a true duplicate id
+still answers 409.
+
 - Old `accounts`/`opportunities` tables are removed. The Worker uses
-  `env.EIGYO_DB` when the binding exists; with no binding (`node --test`,
-  wrangler dev without D1) a clearly-marked **DEMO** in-memory fallback
-  holds sealed envelopes only — never plaintext — so handlers can be
-  exercised. The plaintext store is **no longer a persistence path**.
+  `env.EIGYO_DB` for every auth and records operation; with no binding
+  the auth/records routes answer **503** — the former DEMO in-memory
+  fallback is **deleted**, and no production route reads or writes any
+  memory store (the only remaining `Map` in `src/auth.js` is the static
+  base58 decode table; `src/sfa.js` `createStore` is the client-side
+  domain library over decrypted data, not a Worker route).
+- `seq` is **server-allocated** from a per-owner counter row
+  (`owner_seq_counters`): one atomic upsert
+  (`INSERT … ON CONFLICT(owner_id) DO UPDATE SET seq = seq + 1
+  RETURNING seq`) hands out the value, so parallel same-owner writes
+  always receive distinct `seq`s; `UNIQUE(owner_id, seq)` plus
+  retry-on-collision covers a lagging counter. The optional client
+  `seq` on `POST /records` is validated for shape (integer ≥ 0) and
+  otherwise ignored — the server value is authoritative.
 - wrangler.jsonc keeps the zero-UUID placeholder. No real D1 database is
   created; `grep -c '"r2_buckets"' wrangler.jsonc` must print `0`.
 
@@ -310,7 +350,9 @@ GET  /health, GET /ipfs/<cid>    unchanged (missing -> 404 never 500; bad CID ->
   from allowlisted keys — unknown keys → 400); the Worker cannot and
   does not decrypt. Other owners' records answer **404** (existence is
   not leaked). A D1 constraint violation answers **409**; any other D1
-  failure answers **503**, never a false 409 (review #6).
+  failure answers **503**, never a false 409 (review #6). `seq` in the
+  response metadata is the server-allocated per-owner counter value
+  (§11.3), never a client-supplied one.
 - Server-side plaintext search/report is **removed by design**: `GET
   /records` returns metadata only (never envelopes). The record list is
   what clients fetch; clients decrypt with the passphrase and run
@@ -329,12 +371,32 @@ e) no key material in repo/logs: source grep (key blocks, secret literals,
 f) HTTP contracts preserved: missing object 404 never 500, bad CID 400,
    `wrangler.jsonc` has no `r2_buckets`. Synthetic data only; no real data.
 
-### 11.7 Out of scope
+### 11.7 D1 auth store (done — not out of scope any more)
 
-- Item 8 (pre-deploy, separate PR — not in this PR): nonces/sessions are
-  isolate-local `Map`s. Moving them to D1/DO with an expiry sweep is
-  required before deploy; this PR does not block items 1–7 on it and
-  leaves a TODO in `src/auth.js` / `src/worker.js`.
+The item-8 TODO is **done**: challenges/sessions moved from isolate-local
+`Map`s to D1 (`env.EIGYO_DB`) — hash-only (`nonce_hash`/`session_hash`
+= SHA-256 hex, 0 raw values in the DB), atomic single-use via
+`UPDATE … WHERE used = 0 AND expires_at > ?` with `meta.changes === 1`
+(a failed verify burns the nonce), expiry sweep + oldest-first trim
+beyond 10,000 rows on the challenge/verify paths, IP-keyed
+`AUTH_RATE_LIMIT` throttling (no DID caps — see §11.2), no binding →
+**503** (memory fallback deleted), and server-allocated per-owner
+`seq` via `owner_seq_counters` + `UNIQUE(owner_id, seq)` retry.
+Negative controls a–f for THIS store live in `test/d1-auth.test.js`
+(shared fake D1 in `test/fake-d1.js`); the real `schema.sql` is also
+executed under `node:sqlite` in `test/schema-sqlite.test.js` (the
+fake does not parse SQL, so this catches statement/schema typos the
+fake cannot).
+
+**Shared contract with kokyaku:** eigyo and kokyaku use the identical
+`sealed_records` schema (columns `id, owner_id, cid, envelope, seq,
+created_at, updated_at` — zero plaintext columns) and the same auth
+behavior (`x-did` + `x-session`, 5-minute challenge/session lifetimes,
+envelope v2 only, KDF fixed at 600,000). Any change here must be
+mirrored in kokyaku (and vice versa) so both stay in sync — this repo
+change does not touch any kokyaku repo.
+
+Remaining out of scope:
 - No D1 database creation, no paid services, no additional bindings.
 - No `kotoba/*` or `MIGRATION-TODO.md` changes.
 - No server escrow / password reset (by design — §11.1).

@@ -10,7 +10,8 @@
 // platform WebCrypto implementation, whose scalar operations are not
 // observable from JS and are not subject to JS-level timing leakage.
 // Private keys never reach the Worker; the Worker only holds public
-// keys (from dids), single-use nonces, and session ids in memory.
+// keys (from dids), and D1 holds only hashes of single-use nonces and
+// session ids (never the raw values).
 // Kougi review points addressed here:
 //   K1 (non-constant-time scalarMult / Fermat modInv) — GONE: the pure-JS
 //      implementation is deleted. No secret-scalar arithmetic remains
@@ -31,10 +32,10 @@
 //      not secret scalars. With them, the identity forgery above is
 //      rejected (see test/worker.test.js K2 tests).
 //
-// TODO (item 8, out of scope this PR — pre-deploy, separate PR): nonces
-// and sessions are currently held in an isolate-local Map. Moving them
-// to D1/DO with an expiry sweep is pre-deploy work; until then an
-// isolate restart simply forces re-authentication (new challenge).
+// Challenge nonces and sessions live in D1 (env.EIGYO_DB), hash-only:
+// only SHA-256 hex of the raw nonce/session is stored (docs/sfa.md §11.7).
+// No isolate-local auth Map remains; without a binding the Worker
+// answers 503 and never falls back to memory storage.
 //
 // Protocol:
 //   did:key:z<base58btc multicodec ed25519-pubkey>  (prefix bytes ed 01)
@@ -252,6 +253,14 @@ export function didToPubkey(did) {
 export const AUTH_PURPOSE = "eigyo:auth:login";
 export const NONCE_TTL_MS = 5 * 60 * 1000; // single-use, short-lived
 export const SESSION_TTL_MS = 5 * 60 * 1000; // short-lived, DID-bound (5 min, same as nonce)
+// Table-size caps: when a table exceeds its cap the sweep deletes the
+// oldest rows (trim). Issuance is NEVER rejected for table size — DID
+// counting is deliberately not done here (a DID is public, so counting
+// it would let a third party lock out its owner). Issuance throttling
+// is the Cloudflare Rate Limiting binding keyed by client IP, applied
+// in src/worker.js — the IP is never stored in D1.
+export const MAX_CHALLENGE_ROWS = 10_000;
+export const MAX_SESSION_ROWS = 10_000;
 
 export function canonicalAuthMessage({ nonce, purpose, timestamp }) {
   return `${nonce}||${purpose}||${timestamp}`;
@@ -268,17 +277,53 @@ function bytesToHex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-export function createAuthService({ now = () => Date.now(), cryptoImpl = globalThis.crypto } = {}) {
-  // TODO(item 8): isolate-local Maps — move nonces/sessions to D1/DO with
-  // expiry sweep in a separate pre-deploy PR (see header comment).
-  const nonces = new Map(); // nonce -> challenge record
-  const sessions = new Map(); // session id -> { did, expiresAtMs }
+// SHA-256 hex of a raw nonce/session value. Only this digest is ever
+// stored in D1 — raw values exist only in the challenge/verify response.
+export async function sha256Hex(value, cryptoImpl = globalThis.crypto) {
+  const digest = await cryptoImpl.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+  return bytesToHex(new Uint8Array(digest));
+}
 
+export function createAuthService({ now = () => Date.now(), cryptoImpl = globalThis.crypto, db = null } = {}) {
   function randomHex(byteCount) {
     return bytesToHex(cryptoImpl.getRandomValues(new Uint8Array(byteCount)));
   }
 
-  function issueChallenge(did) {
+  // Delete expired challenges/sessions. Runs on BOTH the challenge and
+  // verify paths so expired rows cannot accumulate between requests.
+  async function trimTable(database, table, keyColumn, maxRows) {
+    const row = await database.prepare(`SELECT COUNT(*) AS n FROM ${table}`).bind().first();
+    const n = row && typeof row.n === "number" ? row.n : 0;
+    if (n > maxRows) {
+      await database.prepare(
+        `DELETE FROM ${table} WHERE ${keyColumn} IN (SELECT ${keyColumn} FROM ${table} ORDER BY created_at ASC LIMIT ?)`,
+      ).bind(n - maxRows).run();
+    }
+  }
+
+  async function sweep(database, nowMs) {
+    const statements = [
+      database.prepare("DELETE FROM challenges WHERE expires_at <= ?").bind(nowMs),
+      database.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(nowMs),
+    ];
+    if (typeof database.batch === "function") {
+      await database.batch(statements);
+    } else {
+      for (const stmt of statements) await stmt.run();
+    }
+    // Growth beyond the row caps is handled by oldest-first trim here,
+    // never by rejecting new issuance. The count check gates the delete
+    // (under the cap, trim does nothing), and the created_at indexes
+    // (idx_challenges_created_at / idx_sessions_created_at) back both
+    // the count and the ORDER BY created_at delete, so issuance never
+    // needs a full table scan to decide.
+    await trimTable(database, "challenges", "nonce_hash", MAX_CHALLENGE_ROWS);
+    await trimTable(database, "sessions", "session_hash", MAX_SESSION_ROWS);
+  }
+
+  async function issueChallenge(did, dbOverride) {
+    const database = dbOverride ?? db;
+    if (!database) return { ok: false, error: "store-unavailable" };
     let publicKey;
     try {
       publicKey = didToPubkey(did);
@@ -286,38 +331,59 @@ export function createAuthService({ now = () => Date.now(), cryptoImpl = globalT
       return { ok: false, error: "invalid-did" };
     }
     if (publicKey.length !== 32) return { ok: false, error: "invalid-did" };
+    const issuedAtMs = now();
+    try {
+      await sweep(database, issuedAtMs);
+    } catch {
+      return { ok: false, error: "store-unavailable" };
+    }
     const nonce = randomHex(16);
     const purpose = AUTH_PURPOSE;
-    const issuedAtMs = now();
     const timestamp = new Date(issuedAtMs).toISOString();
-    const record = {
-      did,
-      nonce,
-      purpose,
-      timestamp,
-      expiresAtMs: issuedAtMs + NONCE_TTL_MS,
-      used: false,
-    };
-    nonces.set(nonce, record);
+    try {
+      await database.prepare(
+        "INSERT INTO challenges (nonce_hash, did, purpose, timestamp, expires_at, used, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+      ).bind(await sha256Hex(nonce, cryptoImpl), did, purpose, timestamp, issuedAtMs + NONCE_TTL_MS, issuedAtMs).run();
+    } catch {
+      return { ok: false, error: "store-unavailable" };
+    }
     return {
       ok: true,
       did,
       nonce,
       purpose,
       timestamp,
-      expiresAt: new Date(record.expiresAtMs).toISOString(),
+      expiresAt: new Date(issuedAtMs + NONCE_TTL_MS).toISOString(),
     };
   }
 
-  async function verifyResponse({ did, nonce, signature } = {}) {
-    const record = typeof nonce === "string" ? nonces.get(nonce) : undefined;
-    // Single-use: consume the nonce on the first verify attempt (success or
-    // failure) so a captured signature can never be replayed.
-    const wasUnused = !!record && !record.used;
-    if (record) record.used = true;
-    if (!wasUnused) return { ok: false, error: "auth-failed" };
-    if (record.did !== did) return { ok: false, error: "auth-failed" };
-    if (now() > record.expiresAtMs) return { ok: false, error: "auth-failed" };
+  async function verifyResponse({ did, nonce, signature } = {}, dbOverride) {
+    const database = dbOverride ?? db;
+    if (!database) return { ok: false, error: "store-unavailable" };
+    if (typeof nonce !== "string" || !nonce) return { ok: false, error: "auth-failed" };
+    const nonceHash = await sha256Hex(nonce, cryptoImpl);
+    const nowMs = now();
+    let record;
+    try {
+      await sweep(database, nowMs);
+      // Atomic single-use claim — NEVER read-then-write in two steps.
+      // Only the caller whose UPDATE flips used 0->1 (meta.changes === 1)
+      // proceeds; everyone else (replay, expired, parallel twin) fails.
+      // The claim happens BEFORE signature verification, so a failed
+      // verify (bad signature, wrong DID) also burns the nonce.
+      const claimed = await database.prepare(
+        "UPDATE challenges SET used = 1 WHERE nonce_hash = ? AND used = 0 AND expires_at > ?",
+      ).bind(nonceHash, nowMs).run();
+      if (!claimed || !claimed.meta || claimed.meta.changes !== 1) {
+        return { ok: false, error: "auth-failed" };
+      }
+      record = await database.prepare(
+        "SELECT did, purpose, timestamp FROM challenges WHERE nonce_hash = ?",
+      ).bind(nonceHash).first();
+    } catch {
+      return { ok: false, error: "store-unavailable" };
+    }
+    if (!record || record.did !== did) return { ok: false, error: "auth-failed" };
     if (typeof signature !== "string") return { ok: false, error: "auth-failed" };
     let publicKey;
     try {
@@ -331,28 +397,40 @@ export function createAuthService({ now = () => Date.now(), cryptoImpl = globalT
     } catch {
       return { ok: false, error: "auth-failed" };
     }
-    const message = canonicalAuthMessage(record);
+    const message = canonicalAuthMessage({ nonce, purpose: record.purpose, timestamp: record.timestamp });
     const valid = await ed25519Verify(publicKey, new TextEncoder().encode(message), sigBytes, cryptoImpl);
     if (!valid) return { ok: false, error: "auth-failed" };
     const session = randomHex(32);
     const expiresAtMs = now() + SESSION_TTL_MS;
-    sessions.set(session, { did, expiresAtMs });
+    try {
+      await database.prepare(
+        "INSERT INTO sessions (session_hash, did, expires_at, created_at) VALUES (?, ?, ?, ?)",
+      ).bind(await sha256Hex(session, cryptoImpl), did, expiresAtMs, now()).run();
+    } catch {
+      return { ok: false, error: "store-unavailable" };
+    }
     return { ok: true, session, did, expiresAt: new Date(expiresAtMs).toISOString() };
   }
 
-  // getSession(sessionId, did?) — when did is given, the session must be
-  // bound to that DID (x-did + x-session), otherwise null.
-  function getSession(session, did) {
+  // getSession(session, did?) — when did is given, the session must be
+  // bound to that DID (x-did + x-session), otherwise null. DB errors
+  // throw so callers can answer 503 rather than a misleading 401.
+  async function getSession(session, did, dbOverride) {
+    const database = dbOverride ?? db;
+    if (!database) return null;
     if (typeof session !== "string" || !session) return null;
-    const record = sessions.get(session);
+    const sessionHash = await sha256Hex(session, cryptoImpl);
+    const record = await database.prepare(
+      "SELECT did, expires_at FROM sessions WHERE session_hash = ?",
+    ).bind(sessionHash).first();
     if (!record) return null;
-    if (now() > record.expiresAtMs) {
-      sessions.delete(session);
+    if (now() > record.expires_at) {
+      await database.prepare("DELETE FROM sessions WHERE session_hash = ?").bind(sessionHash).run();
       return null;
     }
     if (did !== undefined && did !== null && record.did !== did) return null;
     return record.did;
   }
 
-  return { issueChallenge, verifyResponse, getSession, _stores: { nonces, sessions } };
+  return { issueChallenge, verifyResponse, getSession };
 }

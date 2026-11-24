@@ -5,14 +5,13 @@
 //
 // E2EE STAGE-2 (docs/sfa.md §11):
 // - Persistence = env.EIGYO_DB (D1 binding in wrangler.jsonc; zero-UUID
-//   placeholder, not created) holding sealed_records ONLY: ciphertext +
-//   metadata, no plaintext columns. The plaintext in-memory store is GONE as
-//   a persistence path: when no EIGYO_DB binding is present (local
-//   `node --test`, wrangler dev without D1), a clearly-marked DEMO fallback
-//   holds sealed envelopes (ciphertext only, never plaintext) so the
-//   handlers can be exercised without D1. Search/report over plaintext
-//   happens client-side only (src/sfa.js operates on decrypted data);
-//   there is deliberately no server-side plaintext search/report route.
+//   placeholder, not created) holding sealed_records plus auth tables
+//   (challenges, sessions, owner_seq_counters): ciphertext + metadata
+//   only, no plaintext columns. There is NO in-memory fallback: with no
+//   EIGYO_DB binding, auth and records routes answer 503 (never memory
+//   storage). Search/report over plaintext happens client-side only
+//   (src/sfa.js operates on decrypted data); there is deliberately no
+//   server-side plaintext search/report route.
 // - Auth = Awai identity did:key. POST /auth/challenge issues a single-use
 //   short-lived nonce; POST /auth/verify checks the Ed25519 signature
 //   (WebCrypto, src/auth.js) against the DID public key and issues a
@@ -22,9 +21,12 @@
 //   query-param trust is REMOVED — protected routes accept only a verified
 //   session. Private keys, passphrases and KEKs never reach this Worker.
 //   Lifetimes: challenge nonce 5 minutes AND session 5 minutes.
-//   TODO(item 8, out of scope this PR): nonces/sessions are isolate-local
-//   Maps (src/auth.js); moving them to D1/DO with an expiry sweep is
-//   pre-deploy work for a separate PR.
+//   Nonces/sessions live in D1 as SHA-256 hashes only; single-use is an
+//   atomic UPDATE...WHERE used=0 AND expires_at>now (meta.changes === 1);
+//   expired rows are swept on the challenge/verify paths; tables beyond
+//   10,000 rows are trimmed oldest-first (never rejected). Issuance
+//   throttling is the AUTH_RATE_LIMIT Cloudflare Rate Limiting binding
+//   keyed by client IP (never stored in D1); it is not counted by DID.
 // - Missing objects answer 404, never 500 (cf. no-r2-yataverse-only.md);
 //   bad CID -> 400 before any fetch runs; malformed %-encoding -> 400,
 //   never a thrown URIError. D1 constraint violation -> 409, any other
@@ -38,8 +40,8 @@
 // HTTP surface (see docs/sfa.md §7/§11):
 //   GET  /health
 //   GET  /ipfs/<cid>                       yataverse proxy (public)
-//   POST /auth/challenge  {did}            -> 201 {nonce, purpose, timestamp} | 400
-//   POST /auth/verify     {did, nonce, signature} -> 200 {session, did, expiresAt} | 401
+//   POST /auth/challenge  {did}            -> 201 {nonce, purpose, timestamp} | 400 | 429 (rate-limit binding) | 503
+//   POST /auth/verify     {did, nonce, signature} -> 200 {session, did, expiresAt} | 401 | 503
 //   POST /records         (x-did+x-session) {id?, cid?, envelope, seq?} -> 201 metadata | 400 | 401 | 409 | 503
 //   GET  /records         (x-did+x-session) -> 200 {items:[metadata...]} (own only) | 401 | 503
 //   GET  /records/:id     (x-did+x-session) -> 200 record | 404 | 401 | 400 | 503
@@ -47,11 +49,6 @@
 import { createAuthService } from "./auth.js";
 
 const YATAVERSE = "https://yataverse.com";
-const authService = createAuthService();
-
-// DEMO ONLY fallback: holds SEALED envelopes (ciphertext + metadata) when
-// env.EIGYO_DB is absent. Never stores plaintext; real persistence is D1.
-const demoRecords = new Map();
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -97,13 +94,29 @@ async function handleIpfs(cid, fetchImpl) {
 }
 
 // Session auth: x-did + x-session (no Bearer, per owner decision).
-// The session must be bound to the presented DID.
-function requireDid(request) {
+// The session must be bound to the presented DID. D1-backed (src/auth.js):
+// the session hash is looked up in env.EIGYO_DB; no binding -> 503.
+async function requireDid(request, db) {
   const did = request.headers?.get("x-did") || "";
   const session = request.headers?.get("x-session") || "";
   if (!did || !session) return null;
-  const sessionDid = authService.getSession(session, did);
+  const sessionDid = await createAuthService({ db }).getSession(session, did);
   return sessionDid === did ? did : null;
+}
+
+// Resolve the authenticated DID for a protected route, or the exact
+// error response: 503 with no binding / on D1 failure, 401 otherwise.
+async function authedDid(request, env) {
+  const db = env?.EIGYO_DB;
+  if (!db) return { error: json({ error: "store-unavailable" }, 503) };
+  let did;
+  try {
+    did = await requireDid(request, db);
+  } catch {
+    return { error: json({ error: "store-unavailable" }, 503) };
+  }
+  if (!did) return { error: json({ error: "unauthorized" }, 401) };
+  return { did };
 }
 
 // ---- strict sealed-envelope validation (review #1, #2, #3) ----
@@ -196,29 +209,58 @@ function isConstraintViolation(err) {
   return /constraint/i.test(String(err?.message ?? err));
 }
 
+// Per-owner monotonic seq: one atomic upsert bumps the counter and
+// RETURNS the new value, so parallel same-owner writes always receive
+// distinct seqs (no read-then-write race, no duplicate seq).
+async function allocateSeq(db, ownerId) {
+  const row = await db.prepare(
+    "INSERT INTO owner_seq_counters (owner_id, seq) VALUES (?, 1) ON CONFLICT(owner_id) DO UPDATE SET seq = seq + 1 RETURNING seq",
+  ).bind(ownerId).first();
+  return row.seq;
+}
+
 async function storeRecord(env, row) {
   const db = env?.EIGYO_DB;
-  if (!db) {
-    if (demoRecords.has(row.id)) return { ok: false, error: "exists" };
-    demoRecords.set(row.id, row);
-    return { ok: true };
+  if (!db) return { ok: false, error: "unavailable" };
+  // Server-allocated seq is authoritative: the optional client seq is
+  // validated for shape only (see POST /records) and never trusted to
+  // be unique. UNIQUE(owner_id, seq) is the backstop: if the counter
+  // ever hands out a seq that already exists (e.g. a lagging counter),
+  // retry with a fresh allocation instead of failing the write.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let seq;
+    try {
+      seq = await allocateSeq(db, row.owner_id);
+      await db.prepare(
+        "INSERT INTO sealed_records (id, owner_id, cid, envelope, seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ).bind(row.id, row.owner_id, row.cid ?? null, row.envelope, seq, row.created_at, row.updated_at).run();
+      return { ok: true, seq };
+    } catch (err) {
+      // Duplicate = constraint violation ONLY (#6); every other D1 failure
+      // is a store outage (503), never a false 409.
+      if (!isConstraintViolation(err)) return { ok: false, error: "unavailable" };
+      // Only a (owner_id, seq) collision is retryable; an id constraint
+      // (or an unspecified one) is a true duplicate.
+      if (!String(err?.message ?? err).includes("owner_id")) {
+        return { ok: false, error: "exists" };
+      }
+      // A constraint hit on an id that is already stored is a true
+      // duplicate (409); any other constraint hit is a seq collision —
+      // allocate a fresh seq and retry.
+      let existing = null;
+      try {
+        existing = await db.prepare("SELECT id FROM sealed_records WHERE id = ?").bind(row.id).first();
+      } catch {
+        return { ok: false, error: "unavailable" };
+      }
+      if (existing) return { ok: false, error: "exists" };
+    }
   }
-  try {
-    await db.prepare(
-      "INSERT INTO sealed_records (id, owner_id, cid, envelope, seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    ).bind(row.id, row.owner_id, row.cid ?? null, row.envelope, row.seq ?? 0, row.created_at, row.updated_at).run();
-    return { ok: true };
-  } catch (err) {
-    // Duplicate = constraint violation ONLY (#6); every other D1 failure
-    // is a store outage (503), never a false 409.
-    if (isConstraintViolation(err)) return { ok: false, error: "exists" };
-    return { ok: false, error: "unavailable" };
-  }
+  return { ok: false, error: "unavailable" };
 }
 
 async function fetchRecordById(env, id) {
   const db = env?.EIGYO_DB;
-  if (!db) return demoRecords.get(id) ?? null;
   const row = await db.prepare(
     "SELECT id, owner_id, cid, envelope, seq, created_at, updated_at FROM sealed_records WHERE id = ?",
   ).bind(id).first();
@@ -227,11 +269,6 @@ async function fetchRecordById(env, id) {
 
 async function listRecordsByOwner(env, ownerId) {
   const db = env?.EIGYO_DB;
-  if (!db) {
-    return [...demoRecords.values()]
-      .filter((row) => row.owner_id === ownerId)
-      .sort((a, b) => (a.seq - b.seq) || (a.created_at < b.created_at ? -1 : 1));
-  }
   const result = await db.prepare(
     "SELECT id, owner_id, cid, envelope, seq, created_at, updated_at FROM sealed_records WHERE owner_id = ? ORDER BY seq, created_at",
   ).bind(ownerId).all();
@@ -253,9 +290,39 @@ export async function fetchHandler(request, env, fetchImpl = fetch) {
   }
 
   if (request.method === "POST" && path === "/auth/challenge") {
+    if (!env?.EIGYO_DB) return json({ error: "store-unavailable" }, 503);
+    // Issuance throttling: Cloudflare Rate Limiting binding keyed by
+    // client IP (the IP is never stored in D1). The key is
+    // cf-connecting-ip ONLY — x-forwarded-for is spoofable and is never
+    // used. With no cf-connecting-ip the binding is not called at all
+    // (no limit, logged). When the binding exists its decision is
+    // passed through as-is — the Worker never counts DIDs or builds
+    // its own 429. Without the binding there is no limit either (that
+    // absence is logged, not silently skipped).
+    const rateLimit = env?.AUTH_RATE_LIMIT;
+    const clientIp = request.headers?.get("cf-connecting-ip") || "";
+    if (rateLimit && clientIp) {
+      let decision;
+      try {
+        decision = await rateLimit.limit({ key: clientIp });
+      } catch {
+        decision = null; // a broken limiter must not lock out issuance
+      }
+      if (decision instanceof Response) return decision;
+      if (decision && decision.success === false) return json({ error: "rate-limited" }, 429);
+    } else if (rateLimit) {
+      console.warn("[eigyo] cf-connecting-ip absent; challenge issuance is not rate limited (x-forwarded-for is never trusted)");
+    } else {
+      console.warn("[eigyo] AUTH_RATE_LIMIT binding absent; challenge issuance is not rate limited");
+    }
     const body = await request.json().catch(() => null);
-    const result = authService.issueChallenge(typeof body?.did === "string" ? body.did : "");
-    if (!result.ok) return json({ error: "invalid-did" }, 400);
+    const result = await createAuthService({ db: env.EIGYO_DB }).issueChallenge(
+      typeof body?.did === "string" ? body.did : "",
+    );
+    if (!result.ok) {
+      if (result.error === "store-unavailable") return json({ error: "store-unavailable" }, 503);
+      return json({ error: "invalid-did" }, 400);
+    }
     return json({
       did: result.did,
       nonce: result.nonce,
@@ -266,19 +333,24 @@ export async function fetchHandler(request, env, fetchImpl = fetch) {
   }
 
   if (request.method === "POST" && path === "/auth/verify") {
+    if (!env?.EIGYO_DB) return json({ error: "store-unavailable" }, 503);
     const body = await request.json().catch(() => null);
-    const result = await authService.verifyResponse({
+    const result = await createAuthService({ db: env.EIGYO_DB }).verifyResponse({
       did: typeof body?.did === "string" ? body.did : "",
       nonce: typeof body?.nonce === "string" ? body.nonce : "",
       signature: typeof body?.signature === "string" ? body.signature : "",
     });
-    if (!result.ok) return json({ error: "auth-failed" }, 401);
+    if (!result.ok) {
+      if (result.error === "store-unavailable") return json({ error: "store-unavailable" }, 503);
+      return json({ error: "auth-failed" }, 401);
+    }
     return json({ session: result.session, did: result.did, expiresAt: result.expiresAt });
   }
 
   if (request.method === "POST" && path === "/records") {
-    const did = requireDid(request);
-    if (!did) return json({ error: "unauthorized" }, 401);
+    const auth = await authedDid(request, env);
+    if (auth.error) return auth.error;
+    const did = auth.did;
     const body = await request.json().catch(() => null);
     if (!body || typeof body !== "object" || Array.isArray(body) ||
         !Object.keys(body).every((k) => BODY_KEYS.has(k))) {
@@ -314,12 +386,13 @@ export async function fetchHandler(request, env, fetchImpl = fetch) {
       if (stored.error === "exists") return json({ error: "exists", id }, 409);
       return json({ error: "store-unavailable" }, 503);
     }
-    return json(metadataOf(row), 201);
+    return json(metadataOf({ ...row, seq: stored.seq }), 201);
   }
 
   if (request.method === "GET" && path === "/records") {
-    const did = requireDid(request);
-    if (!did) return json({ error: "unauthorized" }, 401);
+    const auth = await authedDid(request, env);
+    if (auth.error) return auth.error;
+    const did = auth.did;
     let rows;
     try {
       rows = await listRecordsByOwner(env, did);
@@ -331,8 +404,9 @@ export async function fetchHandler(request, env, fetchImpl = fetch) {
 
   const recordMatch = path.match(/^\/records\/([^/]+)$/);
   if (request.method === "GET" && recordMatch) {
-    const did = requireDid(request);
-    if (!did) return json({ error: "unauthorized" }, 401);
+    const auth = await authedDid(request, env);
+    if (auth.error) return auth.error;
+    const did = auth.did;
     const id = safeDecode(recordMatch[1]);
     if (id === null) return json({ error: "bad-id" }, 400);
     let row;
