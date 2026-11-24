@@ -10,9 +10,10 @@ import {
   ed25519PublicKeyFromSeed,
   ed25519Sign,
   ed25519Verify,
+  isSmallOrderEncoding,
   pubkeyToDid,
 } from "../src/auth.js";
-import { openPayload, sealPayload } from "../src/seal.js";
+import { openPayload, rewrapPayload, sealPayload } from "../src/seal.js";
 
 // Synthetic data only — no real opportunity/customer data in this repo.
 const synthetic = {
@@ -25,13 +26,19 @@ const synthetic = {
 const PASS = "synthetic-worker-test-passphrase";
 
 const base = "http://localhost";
-const req = (method, path, body, token) =>
+const req = (method, path, body, auth) =>
   new Request(base + path, {
     method,
     headers: {
       "content-type": "application/json",
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(auth ? { "x-did": auth.did, "x-session": auth.session } : {}),
     },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+const rawReq = (method, path, body, headers) =>
+  new Request(base + path, {
+    method,
+    headers: { "content-type": "application/json", ...(headers || {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 
@@ -55,10 +62,11 @@ async function makeSession() {
   const verifyRes = await fetchHandler(req("POST", "/auth/verify", { did, nonce: challenge.nonce, signature }), {});
   assert.equal(verifyRes.status, 200);
   const verified = await json(verifyRes);
-  return { seed, did, token: verified.token };
+  assert.ok(verified.session);
+  return { seed, did, session: verified.session };
 }
 
-describe("ed25519 pure-JS vs RFC 8032 vectors + native Node Ed25519", () => {
+describe("ed25519 WebCrypto vs RFC 8032 vectors + native Node Ed25519 (#4)", () => {
   const fromHex = (h) => new Uint8Array(Buffer.from(h, "hex"));
   const hex = (b) => Buffer.from(b).toString("hex");
   // RFC 8032 Section 7.1 (seed, pubkey, msg, sig).
@@ -164,9 +172,10 @@ describe("auth service (challenge/verify/session, unit)", () => {
     const sig3 = Buffer.from(await ed25519Sign(seed, new TextEncoder().encode(msg3))).toString("base64");
     const verified = await auth.verifyResponse({ did, nonce: c3.nonce, signature: sig3 });
     assert.equal(verified.ok, true);
-    assert.equal(auth.getSession(verified.token), did);
-    t += 30 * 60 * 1000 + 1;
-    assert.equal(auth.getSession(verified.token), null);
+    assert.equal(auth.getSession(verified.session, did), did);
+    assert.equal(auth.getSession(verified.session, "did:key:zOther"), null);
+    t += 5 * 60 * 1000 + 1;
+    assert.equal(auth.getSession(verified.session, did), null);
   });
 });
 
@@ -198,10 +207,11 @@ describe("worker http surface", () => {
   });
 
   it("sealed records: end-to-end seal -> store -> fetch -> open (negative-control a)", async () => {
-    const { did, token } = await makeSession();
+    const { did, session } = await makeSession();
+    const auth = { did, session };
     const envelope = await sealPayload(synthetic, PASS);
     const created = await fetchHandler(
-      req("POST", "/records", { id: "record_alpha", envelope, cid: "bafy-synthetic-cid", seq: 1 }, token),
+      req("POST", "/records", { id: "11111111-1111-4111-8111-111111111111", envelope, cid: "bafy-synthetic-cid", seq: 1 }, auth),
       {},
     );
     assert.equal(created.status, 201);
@@ -211,14 +221,14 @@ describe("worker http surface", () => {
     assert.equal(meta.envelope, undefined); // metadata only
     assert.equal(JSON.stringify(meta).includes("Synthetic"), false);
 
-    const fetched = await fetchHandler(req("GET", "/records/record_alpha", undefined, token), {});
+    const fetched = await fetchHandler(req("GET", "/records/11111111-1111-4111-8111-111111111111", undefined, auth), {});
     assert.equal(fetched.status, 200);
     const record = await json(fetched);
     assert.deepEqual(await openPayload(record.envelope, PASS), synthetic);
 
-    const listed = await fetchHandler(req("GET", "/records", undefined, token), {});
+    const listed = await fetchHandler(req("GET", "/records", undefined, auth), {});
     const items = (await json(listed)).items;
-    assert.ok(items.some((r) => r.id === "record_alpha"));
+    assert.ok(items.some((r) => r.id === "11111111-1111-4111-8111-111111111111"));
     assert.ok(items.every((r) => r.envelope === undefined)); // list never leaks envelopes
   });
 
@@ -226,41 +236,41 @@ describe("worker http surface", () => {
     const a = await makeSession();
     const b = await makeSession();
     const envelope = await sealPayload(synthetic, PASS);
-    await fetchHandler(req("POST", "/records", { id: "record_bravo", envelope }, a.token), {});
+    await fetchHandler(req("POST", "/records", { id: "22222222-2222-4222-8222-222222222222", envelope }, a), {});
     // other owner -> 404 (existence not leaked), missing -> 404 never 500
-    assert.equal((await fetchHandler(req("GET", "/records/record_bravo", undefined, b.token), {})).status, 404);
-    const missing = await fetchHandler(req("GET", "/records/nope", undefined, a.token), {});
+    assert.equal((await fetchHandler(req("GET", "/records/22222222-2222-4222-8222-222222222222", undefined, b), {})).status, 404);
+    const missing = await fetchHandler(req("GET", "/records/nope", undefined, a), {});
     assert.equal(missing.status, 404);
     assert.notEqual(missing.status, 500);
     // bad envelope / bad cid / bad seq / duplicate
     assert.equal(
-      (await fetchHandler(req("POST", "/records", { envelope: { v: 2 } }, a.token), {})).status,
+      (await fetchHandler(req("POST", "/records", { envelope: { v: 2 } }, a), {})).status,
       400,
     );
     assert.equal(
-      (await fetchHandler(req("POST", "/records", { envelope, cid: "a/b" }, a.token), {})).status,
+      (await fetchHandler(req("POST", "/records", { envelope, cid: "a/b" }, a), {})).status,
       400,
     );
     assert.equal(
-      (await fetchHandler(req("POST", "/records", { envelope, seq: -1 }, a.token), {})).status,
+      (await fetchHandler(req("POST", "/records", { envelope, seq: -1 }, a), {})).status,
       400,
     );
     assert.equal(
-      (await fetchHandler(req("POST", "/records", { id: "record_bravo", envelope }, a.token), {})).status,
+      (await fetchHandler(req("POST", "/records", { id: "22222222-2222-4222-8222-222222222222", envelope }, a), {})).status,
       409,
     );
     assert.equal(
-      (await fetchHandler(req("POST", "/records", { envelope, cid: "bad cid" }, a.token), {})).status,
+      (await fetchHandler(req("POST", "/records", { envelope, cid: "bad cid" }, a), {})).status,
       400,
     );
   });
 
   it("plaintext routes are removed (server-side search/report gone by design)", async () => {
-    const { token } = await makeSession();
-    assert.equal((await fetchHandler(req("GET", "/opportunities", undefined, token), {})).status, 404);
-    assert.equal((await fetchHandler(req("POST", "/opportunities", { name: "X" }, token), {})).status, 404);
-    assert.equal((await fetchHandler(req("GET", "/report", undefined, token), {})).status, 404);
-    assert.equal((await fetchHandler(req("GET", "/accounts", undefined, token), {})).status, 404);
+    const auth = await makeSession();
+    assert.equal((await fetchHandler(req("GET", "/opportunities", undefined, auth), {})).status, 404);
+    assert.equal((await fetchHandler(req("POST", "/opportunities", { name: "X" }, auth), {})).status, 404);
+    assert.equal((await fetchHandler(req("GET", "/report", undefined, auth), {})).status, 404);
+    assert.equal((await fetchHandler(req("GET", "/accounts", undefined, auth), {})).status, 404);
   });
 });
 
@@ -307,23 +317,24 @@ describe("EIGYO_DB (D1) wiring via fake D1", () => {
   it("stores/fetches sealed_records via env.EIGYO_DB (ciphertext only)", async () => {
     const db = fakeD1();
     const env = { EIGYO_DB: db };
-    const { did, token } = await makeSession();
+    const { did, session } = await makeSession();
+    const auth = { did, session };
     // auth calls use the shared in-memory auth service regardless of env
     const envelope = await sealPayload(synthetic, PASS);
-    const created = await fetchHandler(req("POST", "/records", { id: "record_d1", envelope }, token), env);
+    const created = await fetchHandler(req("POST", "/records", { id: "33333333-3333-4333-8333-333333333333", envelope }, auth), env);
     assert.equal(created.status, 201);
-    const row = db._rows.get("record_d1");
+    const row = db._rows.get("33333333-3333-4333-8333-333333333333");
     assert.ok(row);
     assert.equal(row.owner_id, did);
     const storedText = JSON.stringify(row);
     assert.equal(storedText.includes(synthetic.name), false);
     assert.equal(storedText.includes("Synthetic Co 000"), false);
 
-    const fetched = await fetchHandler(req("GET", "/records/record_d1", undefined, token), env);
+    const fetched = await fetchHandler(req("GET", "/records/33333333-3333-4333-8333-333333333333", undefined, auth), env);
     assert.equal(fetched.status, 200);
     assert.deepEqual(await openPayload((await json(fetched)).envelope, PASS), synthetic);
-    const listed = await json(await fetchHandler(req("GET", "/records", undefined, token), env));
-    assert.ok(listed.items.some((r) => r.id === "record_d1"));
+    const listed = await json(await fetchHandler(req("GET", "/records", undefined, auth), env));
+    assert.ok(listed.items.some((r) => r.id === "33333333-3333-4333-8333-333333333333"));
     assert.ok(listed.items.every((r) => r.envelope === undefined));
   });
 });
@@ -406,5 +417,203 @@ describe("R2 non-dependence + schema (negative-control f) + no key material (e)"
       assert.equal(/(passphrase|password|seed)\s*[:=]\s*['"][^'"]{8,}['"]/i.test(src), false, `${file} must not assign secret literals`);
       assert.equal(/searchParams\.get\("role"\)|searchParams\.get\("userId"\)|userId/.test(src), false, `${file} must not trust role/userId params`);
     }
+  });
+});
+
+describe("review #1: server rejects plaintext / unknown keys / bad base64+lengths / bad id", () => {
+  it("rejects the Organizer plaintext payload with 400 and stores nothing", async () => {
+    const auth = await makeSession();
+    const res = await fetchHandler(
+      req("POST", "/records", {
+        id: "Acme Corp deal",
+        envelope: { v: 1, alg: "AES-256-GCM", iv: "x", data: "PLAINTEXT Acme", name: "PLAINTEXT extra" },
+      }, auth),
+      {},
+    );
+    assert.equal(res.status, 400);
+    assert.equal((await json(res)).error, "bad-envelope");
+    assert.equal((await fetchHandler(req("GET", "/records/Acme%20Corp%20deal", undefined, auth), {})).status, 404);
+  });
+  it("rejects unknown envelope/wrappedKey/kdf keys and non-allowlisted body keys", async () => {
+    const auth = await makeSession();
+    const envelope = await sealPayload(synthetic, PASS);
+    assert.equal((await fetchHandler(req("POST", "/records", { envelope: { ...envelope, name: "PLAINTEXT extra" } }, auth), {})).status, 400);
+    assert.equal((await fetchHandler(req("POST", "/records", { envelope: { ...envelope, wrappedKey: { ...envelope.wrappedKey, extra: "x" } } }, auth), {})).status, 400);
+    assert.equal((await fetchHandler(req("POST", "/records", { envelope: { ...envelope, kdf: { ...envelope.kdf, extra: 1 } } }, auth), {})).status, 400);
+    assert.equal((await fetchHandler(req("POST", "/records", { envelope, name: "PLAINTEXT" }, auth), {})).status, 400);
+  });
+  it("rejects bad base64 and wrong field lengths (iv/salt/wrapped/data)", async () => {
+    const auth = await makeSession();
+    const envelope = await sealPayload(synthetic, PASS);
+    const b64 = (n) => Buffer.alloc(n, 7).toString("base64");
+    const cases = [
+      { ...envelope, iv: "!!not-base64!!" },
+      { ...envelope, iv: b64(8) },
+      { ...envelope, data: b64(4) },
+      { ...envelope, wrappedKey: { ...envelope.wrappedKey, iv: b64(16) } },
+      { ...envelope, wrappedKey: { ...envelope.wrappedKey, data: b64(32) } },
+      { ...envelope, kdf: { ...envelope.kdf, salt: b64(8) } },
+    ];
+    for (const env of cases) {
+      assert.equal((await fetchHandler(req("POST", "/records", { envelope: env }, auth), {})).status, 400);
+    }
+  });
+  it("rejects ids that are neither server-issued (record_<32hex>) nor UUID", async () => {
+    const auth = await makeSession();
+    const envelope = await sealPayload(synthetic, PASS);
+    for (const badId of ["Acme Corp deal", "record_alpha", "plain-id", "123"]) {
+      assert.equal((await fetchHandler(req("POST", "/records", { id: badId, envelope }, auth), {})).status, 400, `bad id ${badId}`);
+    }
+    assert.equal((await fetchHandler(req("POST", "/records", { id: `record_${"a".repeat(32)}`, envelope }, auth), {})).status, 201);
+    assert.equal((await fetchHandler(req("POST", "/records", { id: "44444444-4444-4444-8444-444444444444", envelope }, auth), {})).status, 201);
+    const generated = await fetchHandler(req("POST", "/records", { envelope }, auth), {});
+    assert.equal(generated.status, 201);
+    assert.match((await json(generated)).id, /^record_[0-9a-f]{32}$/);
+  });
+});
+
+describe("review #2: POST /records accepts v2 only (v1 rejected)", () => {
+  it("rejects a well-formed v1 envelope on POST /records with 400", async () => {
+    const { sealPayloadV1, newKey } = await import("../src/seal.js");
+    const auth = await makeSession();
+    const v1 = await sealPayloadV1(synthetic, await newKey());
+    assert.equal(v1.v, 1);
+    assert.equal((await fetchHandler(req("POST", "/records", { envelope: v1 }, auth), {})).status, 400);
+  });
+});
+
+describe("review #3: KDF 600,000 + salt 16B enforced server-side", () => {
+  it("rejects iterations:1 / empty salt / iterations:30000000 with 400", async () => {
+    const auth = await makeSession();
+    const envelope = await sealPayload(synthetic, PASS);
+    const cases = [
+      { ...envelope, kdf: { ...envelope.kdf, iterations: 1 } },
+      { ...envelope, kdf: { ...envelope.kdf, salt: "" } },
+      { ...envelope, kdf: { ...envelope.kdf, iterations: 30000000 } },
+      { ...envelope, kdf: { ...envelope.kdf, iterations: 599999 } },
+    ];
+    for (const env of cases) {
+      assert.equal((await fetchHandler(req("POST", "/records", { envelope: env }, auth), {})).status, 400);
+    }
+  });
+});
+
+describe("review #5: no Bearer — x-did + x-session only", () => {
+  it("rejects Authorization header auth and requires the x-did/x-session pair", async () => {
+    const auth = await makeSession();
+    const envelope = await sealPayload(synthetic, PASS);
+    const headers = {};
+    headers["authorization"] = "Bearer " + auth.session;
+    assert.equal((await fetchHandler(rawReq("POST", "/records", { envelope }, headers), {})).status, 401);
+    assert.equal((await fetchHandler(rawReq("GET", "/records", undefined, { "x-session": auth.session }), {})).status, 401);
+    assert.equal((await fetchHandler(rawReq("GET", "/records", undefined, { "x-did": auth.did }), {})).status, 401);
+    const other = await makeSession();
+    assert.equal((await fetchHandler(req("GET", "/records", undefined, { did: other.did, session: auth.session }), {})).status, 401);
+    assert.equal((await fetchHandler(req("GET", "/records", undefined, auth), {})).status, 200);
+  });
+});
+
+describe("review #6: D1 failure is 503, duplicate only on constraint violation", () => {
+  function failingD1(message) {
+    return { prepare() { return { bind() { return {
+      async run() { throw new Error(message); },
+      async first() { throw new Error(message); },
+      async all() { throw new Error(message); },
+    }; } }; } };
+  }
+  it("maps a generic D1 error to 503 (not 409) and a constraint violation to 409", async () => {
+    const auth = await makeSession();
+    const envelope = await sealPayload(synthetic, PASS);
+    const generic = await fetchHandler(req("POST", "/records", { envelope }, auth), { EIGYO_DB: failingD1("D1_ERROR: database is locked") });
+    assert.equal(generic.status, 503);
+    assert.deepEqual(await json(generic), { error: "store-unavailable" });
+    const constraint = await fetchHandler(req("POST", "/records", { envelope }, auth), { EIGYO_DB: failingD1("UNIQUE constraint failed: sealed_records.id") });
+    assert.equal(constraint.status, 409);
+    assert.equal((await fetchHandler(req("GET", "/records", undefined, auth), { EIGYO_DB: failingD1("boom") })).status, 503);
+    assert.equal((await fetchHandler(req("GET", "/records/11111111-1111-4111-8111-111111111111", undefined, auth), { EIGYO_DB: failingD1("boom") })).status, 503);
+  });
+});
+
+describe("review #7: malformed %-encoding returns 400, never throws", () => {
+  it("GET /records/%E0%A4 and GET /ipfs/%E0%A4 answer 400", async () => {
+    const auth = await makeSession();
+    assert.equal((await fetchHandler(req("GET", "/records/%E0%A4", undefined, auth), {})).status, 400);
+    let fetched = false;
+    const spyFetch = async () => { fetched = true; return new Response("x"); };
+    assert.equal((await fetchHandler(req("GET", "/ipfs/%E0%A4"), {}, spyFetch)).status, 400);
+    assert.equal(fetched, false);
+  });
+});
+
+describe("Kougi K1/K2: pure-JS Ed25519 deleted; small-order/non-canonical rejected", () => {
+  it("K1: src/auth.js contains no pure-JS secret-scalar code (scalarMult/modInv gone)", () => {
+    const raw = readFileSync(new URL("../src/auth.js", import.meta.url), "utf8");
+    // Header comments document the deleted code by name; check code only.
+    const src = raw.split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+    assert.equal(src.includes("function scalarMult"), false);
+    assert.equal(src.includes("function modInv"), false);
+    assert.equal(src.includes("function modPow"), false);
+    assert.equal(src.includes("scalarMult("), false);
+    assert.ok(src.includes('"Ed25519"'));
+    assert.ok(src.includes("subtle.verify"));
+    assert.ok(src.includes("subtle.sign"));
+  });
+  it("K2: identity (small-order) forgery that raw WebCrypto accepts is rejected", async () => {
+    const identity = new Uint8Array(32);
+    identity[0] = 1;
+    assert.equal(isSmallOrderEncoding(identity), true);
+    const basepoint = Buffer.from("5866666666666666666666666666666666666666666666666666666666666666", "hex");
+    const s1 = new Uint8Array(32);
+    s1[0] = 1;
+    const forged = new Uint8Array(Buffer.concat([basepoint, Buffer.from(s1)]));
+    assert.equal(await ed25519Verify(identity, new TextEncoder().encode("anything"), forged), false);
+    const smallHex = [
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "0100000000000000000000000000000000000000000000000000000000000000",
+      "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+      "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+      "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+      "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    ];
+    for (const h of smallHex) {
+      const key = new Uint8Array(Buffer.from(h, "hex"));
+      assert.equal(isSmallOrderEncoding(key), true, h);
+      assert.equal(await ed25519Verify(key, new TextEncoder().encode("x"), forged), false, h);
+    }
+  });
+  it("K2: non-canonical encodings (y+p public key, S+L signature) are rejected", async () => {
+    const fromHex = (h) => new Uint8Array(Buffer.from(h, "hex"));
+    const pub = fromHex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    const sig = fromHex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155" + "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
+    const empty = new Uint8Array(0);
+    assert.equal(await ed25519Verify(pub, empty, sig), true);
+    const p = (1n << 255n) - 19n;
+    const sign = (pub[31] >> 7) & 1;
+    const yBytes = Uint8Array.from(pub);
+    yBytes[31] &= 0x7f;
+    let y = 0n;
+    for (let i = 31; i >= 0; i--) y = (y << 8n) | BigInt(yBytes[i]);
+    const nonCanon = new Uint8Array(32);
+    let v = y + p;
+    for (let i = 0; i < 32; i++) { nonCanon[i] = Number(v & 0xffn); v >>= 8n; }
+    if (sign) nonCanon[31] |= 0x80;
+    assert.equal(await ed25519Verify(nonCanon, empty, sig), false);
+    const L = (1n << 252n) + 27742317777372353535851937790883648493n;
+    let s = 0n;
+    const sBytes = sig.slice(32);
+    for (let i = 31; i >= 0; i--) s = (s << 8n) | BigInt(sBytes[i]);
+    const s2Bytes = new Uint8Array(32);
+    let w = s + L;
+    for (let i = 0; i < 32; i++) { s2Bytes[i] = Number(w & 0xffn); w >>= 8n; }
+    const sigNonCanon = new Uint8Array(Buffer.concat([Buffer.from(sig.slice(0, 32)), Buffer.from(s2Bytes)]));
+    assert.equal(await ed25519Verify(pub, empty, sigNonCanon), false);
+  });
+});
+
+describe("Kougi K3: build script syntax-checks src/auth.js", () => {
+  it("package.json build includes node --check src/auth.js", () => {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    assert.ok(pkg.scripts.build.includes("node --check src/auth.js"), pkg.scripts.build);
   });
 });

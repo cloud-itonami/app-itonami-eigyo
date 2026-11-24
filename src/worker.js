@@ -15,21 +15,34 @@
 //   there is deliberately no server-side plaintext search/report route.
 // - Auth = Awai identity did:key. POST /auth/challenge issues a single-use
 //   short-lived nonce; POST /auth/verify checks the Ed25519 signature
-//   against the DID public key and issues a short-lived DID-bound session
-//   (Bearer). Owner scope = the verified DID. The old role/userId
+//   (WebCrypto, src/auth.js) against the DID public key and issues a
+//   short-lived DID-bound session. Sessions are presented via `x-did` +
+//   `x-session` headers (owner decision: no Authorization: Bearer, same as
+//   kokyaku). Owner scope = the verified DID. The old role/userId
 //   query-param trust is REMOVED — protected routes accept only a verified
 //   session. Private keys, passphrases and KEKs never reach this Worker.
+//   Lifetimes: challenge nonce 5 minutes AND session 5 minutes.
+//   TODO(item 8, out of scope this PR): nonces/sessions are isolate-local
+//   Maps (src/auth.js); moving them to D1/DO with an expiry sweep is
+//   pre-deploy work for a separate PR.
 // - Missing objects answer 404, never 500 (cf. no-r2-yataverse-only.md);
-//   bad CID -> 400 before any fetch runs.
+//   bad CID -> 400 before any fetch runs; malformed %-encoding -> 400,
+//   never a thrown URIError. D1 constraint violation -> 409, any other
+//   store failure -> 503.
+// - POST /records accepts envelope v2 ONLY (v1 is client-side
+//   open-then-reseal migration only, never a new save). Envelopes are
+//   rebuilt from allowlisted keys only and validated strictly (base64 +
+//   fixed lengths, KDF 600,000 / salt 16B) — unknown keys -> 400, never
+//   stored. Record ids must be server-issued (`record_<32 hex>`) or UUID.
 //
 // HTTP surface (see docs/sfa.md §7/§11):
 //   GET  /health
 //   GET  /ipfs/<cid>                       yataverse proxy (public)
 //   POST /auth/challenge  {did}            -> 201 {nonce, purpose, timestamp} | 400
-//   POST /auth/verify     {did, nonce, signature} -> 200 {token} | 401
-//   POST /records         (auth) {id?, cid?, envelope, seq?} -> 201 metadata | 400 | 401 | 409
-//   GET  /records         (auth)           -> 200 {items:[metadata...]} (own only)
-//   GET  /records/:id     (auth)           -> 200 record | 404 | 401
+//   POST /auth/verify     {did, nonce, signature} -> 200 {session, did, expiresAt} | 401
+//   POST /records         (x-did+x-session) {id?, cid?, envelope, seq?} -> 201 metadata | 400 | 401 | 409 | 503
+//   GET  /records         (x-did+x-session) -> 200 {items:[metadata...]} (own only) | 401 | 503
+//   GET  /records/:id     (x-did+x-session) -> 200 record | 404 | 401 | 400 | 503
 
 import { createAuthService } from "./auth.js";
 
@@ -54,6 +67,16 @@ function validCid(cid) {
     !/[\s\u0000-\u001f\u007f]/.test(cid);
 }
 
+// decodeURIComponent throws URIError on malformed %-encoding (e.g. %E0%A4).
+// The contract is 400/404, never a throw — decode safely, null on bad input.
+function safeDecode(text) {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return null;
+  }
+}
+
 async function handleIpfs(cid, fetchImpl) {
   if (!validCid(cid)) return json({ error: "bad-cid", cid }, 400);
   let upstream;
@@ -73,24 +96,85 @@ async function handleIpfs(cid, fetchImpl) {
   return new Response(body, { status: 200, headers });
 }
 
+// Session auth: x-did + x-session (no Bearer, per owner decision).
+// The session must be bound to the presented DID.
 function requireDid(request) {
-  const header = request.headers?.get?.("authorization") || "";
-  const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
-  return authService.getSession(token);
+  const did = request.headers?.get("x-did") || "";
+  const session = request.headers?.get("x-session") || "";
+  if (!did || !session) return null;
+  const sessionDid = authService.getSession(session, did);
+  return sessionDid === did ? did : null;
 }
 
-function isSealedEnvelope(envelope) {
-  if (!envelope || typeof envelope !== "object") return false;
-  if (envelope.alg !== "AES-256-GCM") return false;
-  if (typeof envelope.iv !== "string" || !envelope.iv) return false;
-  if (typeof envelope.data !== "string" || !envelope.data) return false;
-  if (envelope.v === 1) return true; // v1 stays storable until migration is done
-  if (envelope.v !== 2) return false;
+// ---- strict sealed-envelope validation (review #1, #2, #3) ----
+// Per e2ee-params.md §2: {v, alg, iv, data, wrappedKey{alg,iv,data},
+// kdf{name,iterations,salt}}. Only allowlisted keys are accepted; unknown
+// keys anywhere -> 400. The stored envelope is REBUILT from the validated
+// fields only, so nothing client-supplied beyond the allowlist is stored.
+const ENVELOPE_KEYS = new Set(["v", "alg", "iv", "data", "wrappedKey", "kdf"]);
+const WRAPPED_KEY_KEYS = new Set(["alg", "iv", "data"]);
+const KDF_KEYS = new Set(["name", "iterations", "salt"]);
+const BODY_KEYS = new Set(["id", "cid", "envelope", "seq"]);
+const KDF_ITERATIONS = 600_000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SERVER_ID_RE = /^record_[0-9a-f]{32}$/;
+
+function isValidRecordId(id) {
+  return typeof id === "string" && (UUID_RE.test(id) || SERVER_ID_RE.test(id));
+}
+
+function hasOnlyKeys(obj, allowed) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+  return Object.keys(obj).every((k) => allowed.has(k)) && Object.keys(obj).length === allowed.size;
+}
+
+// Strict base64: canonical alphabet/padding, re-encode must round-trip.
+function b64ByteLength(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length % 4 !== 0) return null;
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return null;
+  try {
+    const bin = atob(value);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    let rebin = "";
+    for (const b of bytes) rebin += String.fromCharCode(b);
+    if (btoa(rebin) !== value) return null;
+    return bytes.length;
+  } catch {
+    return null;
+  }
+}
+
+// Returns a rebuilt envelope containing ONLY allowlisted fields, or null.
+function rebuildEnvelope(envelope) {
+  if (!hasOnlyKeys(envelope, ENVELOPE_KEYS)) return null;
+  // v2 ONLY for new saves (#2): v1 is client-side migration only.
+  if (envelope.v !== 2) return null;
+  if (envelope.alg !== "AES-256-GCM") return null;
+  // iv 12B, data >= 16B (ciphertext + GCM tag).
+  if (b64ByteLength(envelope.iv) !== 12) return null;
+  const dataLen = b64ByteLength(envelope.data);
+  if (dataLen === null || dataLen < 16) return null;
   const wk = envelope.wrappedKey;
-  if (!wk || wk.alg !== "AES-256-GCM" || typeof wk.iv !== "string" || typeof wk.data !== "string") return false;
+  if (!hasOnlyKeys(wk, WRAPPED_KEY_KEYS)) return null;
+  if (wk.alg !== "AES-256-GCM") return null;
+  if (b64ByteLength(wk.iv) !== 12) return null;
+  // Wrapped DEK: 32B DEK + 16B GCM tag = 48B.
+  if (b64ByteLength(wk.data) !== 48) return null;
   const kdf = envelope.kdf;
-  return !!kdf && kdf.name === "PBKDF2-HMAC-SHA256" &&
-    Number.isInteger(kdf.iterations) && typeof kdf.salt === "string";
+  if (!hasOnlyKeys(kdf, KDF_KEYS)) return null;
+  if (kdf.name !== "PBKDF2-HMAC-SHA256") return null;
+  // KDF fixation (#3): exactly 600,000 iterations and a 16B salt.
+  if (kdf.iterations !== KDF_ITERATIONS) return null;
+  if (b64ByteLength(kdf.salt) !== 16) return null;
+  return {
+    v: 2,
+    alg: "AES-256-GCM",
+    iv: envelope.iv,
+    data: envelope.data,
+    wrappedKey: { alg: "AES-256-GCM", iv: wk.iv, data: wk.data },
+    kdf: { name: "PBKDF2-HMAC-SHA256", iterations: KDF_ITERATIONS, salt: kdf.salt },
+  };
 }
 
 function newRecordId() {
@@ -108,6 +192,10 @@ function metadataOf(row) {
   };
 }
 
+function isConstraintViolation(err) {
+  return /constraint/i.test(String(err?.message ?? err));
+}
+
 async function storeRecord(env, row) {
   const db = env?.EIGYO_DB;
   if (!db) {
@@ -120,8 +208,11 @@ async function storeRecord(env, row) {
       "INSERT INTO sealed_records (id, owner_id, cid, envelope, seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     ).bind(row.id, row.owner_id, row.cid ?? null, row.envelope, row.seq ?? 0, row.created_at, row.updated_at).run();
     return { ok: true };
-  } catch {
-    return { ok: false, error: "exists" };
+  } catch (err) {
+    // Duplicate = constraint violation ONLY (#6); every other D1 failure
+    // is a store outage (503), never a false 409.
+    if (isConstraintViolation(err)) return { ok: false, error: "exists" };
+    return { ok: false, error: "unavailable" };
   }
 }
 
@@ -156,7 +247,9 @@ export async function fetchHandler(request, env, fetchImpl = fetch) {
   }
 
   if (request.method === "GET" && path.startsWith("/ipfs/")) {
-    return handleIpfs(decodeURIComponent(path.slice("/ipfs/".length)), fetchImpl);
+    const cid = safeDecode(path.slice("/ipfs/".length));
+    if (cid === null) return json({ error: "bad-cid" }, 400);
+    return handleIpfs(cid, fetchImpl);
   }
 
   if (request.method === "POST" && path === "/auth/challenge") {
@@ -180,17 +273,30 @@ export async function fetchHandler(request, env, fetchImpl = fetch) {
       signature: typeof body?.signature === "string" ? body.signature : "",
     });
     if (!result.ok) return json({ error: "auth-failed" }, 401);
-    return json({ token: result.token, did: result.did, expiresAt: result.expiresAt });
+    return json({ session: result.session, did: result.did, expiresAt: result.expiresAt });
   }
 
   if (request.method === "POST" && path === "/records") {
     const did = requireDid(request);
     if (!did) return json({ error: "unauthorized" }, 401);
     const body = await request.json().catch(() => null);
-    if (!isSealedEnvelope(body?.envelope)) return json({ error: "bad-envelope" }, 400);
+    if (!body || typeof body !== "object" || Array.isArray(body) ||
+        !Object.keys(body).every((k) => BODY_KEYS.has(k))) {
+      return json({ error: "bad-envelope" }, 400);
+    }
+    // Rebuild from allowlisted keys only; unknown keys / bad base64 /
+    // bad lengths / v1 / weak KDF -> 400, nothing stored (#1, #2, #3).
+    const envelope = rebuildEnvelope(body.envelope);
+    if (!envelope) return json({ error: "bad-envelope" }, 400);
     const cid = body?.cid ?? null;
     if (cid !== null && !validCid(cid)) return json({ error: "bad-cid", cid }, 400);
-    const id = body?.id ? String(body.id) : newRecordId();
+    let id;
+    if (body?.id !== undefined && body?.id !== null) {
+      if (!isValidRecordId(body.id)) return json({ error: "bad-id" }, 400);
+      id = body.id;
+    } else {
+      id = newRecordId();
+    }
     const seq = body?.seq === undefined ? 0 : Number(body.seq);
     if (!Number.isInteger(seq) || seq < 0) return json({ error: "seq-invalid" }, 400);
     const now = new Date().toISOString();
@@ -198,20 +304,28 @@ export async function fetchHandler(request, env, fetchImpl = fetch) {
       id,
       owner_id: did,
       cid,
-      envelope: JSON.stringify(body.envelope),
+      envelope: JSON.stringify(envelope),
       seq,
       created_at: now,
       updated_at: now,
     };
     const stored = await storeRecord(env, row);
-    if (!stored.ok) return json({ error: "exists", id }, 409);
+    if (!stored.ok) {
+      if (stored.error === "exists") return json({ error: "exists", id }, 409);
+      return json({ error: "store-unavailable" }, 503);
+    }
     return json(metadataOf(row), 201);
   }
 
   if (request.method === "GET" && path === "/records") {
     const did = requireDid(request);
     if (!did) return json({ error: "unauthorized" }, 401);
-    const rows = await listRecordsByOwner(env, did);
+    let rows;
+    try {
+      rows = await listRecordsByOwner(env, did);
+    } catch {
+      return json({ error: "store-unavailable" }, 503);
+    }
     return json({ items: rows.map(metadataOf) });
   }
 
@@ -219,7 +333,14 @@ export async function fetchHandler(request, env, fetchImpl = fetch) {
   if (request.method === "GET" && recordMatch) {
     const did = requireDid(request);
     if (!did) return json({ error: "unauthorized" }, 401);
-    const row = await fetchRecordById(env, decodeURIComponent(recordMatch[1]));
+    const id = safeDecode(recordMatch[1]);
+    if (id === null) return json({ error: "bad-id" }, 400);
+    let row;
+    try {
+      row = await fetchRecordById(env, id);
+    } catch {
+      return json({ error: "store-unavailable" }, 503);
+    }
     // Missing OR owned by someone else -> 404 (existence is not leaked).
     if (!row || row.owner_id !== did) return json({ error: "not-found" }, 404);
     let envelope;

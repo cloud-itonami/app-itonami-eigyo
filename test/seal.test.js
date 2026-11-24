@@ -141,3 +141,45 @@ describe("v1 -> v2 migration", () => {
     assert.deepEqual(await openPayload(await sealPayloadV1(synthetic, imported), imported), synthetic);
   });
 });
+
+// Review #3 (client side): KDF parameters are FIXED, not taken from the
+// envelope. openPayload/rewrapPayload must reject non-600k iterations or
+// non-16B salts BEFORE any PBKDF2 work (no 30M-iteration DoS).
+describe("review #3: KDF fixation in openPayload/rewrapPayload", () => {
+  it("openPayload rejects iterations 1 / 30000000 / bad salt with a kdf error, fast", async () => {
+    const envelope = await sealPayload(synthetic, PASS);
+    const bad = [
+      { ...envelope, kdf: { ...envelope.kdf, iterations: 1 } },
+      { ...envelope, kdf: { ...envelope.kdf, iterations: 30000000 } },
+      { ...envelope, kdf: { ...envelope.kdf, iterations: 599999 } },
+      { ...envelope, kdf: { ...envelope.kdf, salt: "" } },
+      { ...envelope, kdf: { ...envelope.kdf, salt: Buffer.alloc(8, 7).toString("base64") } },
+    ];
+    for (const env of bad) {
+      const t0 = Date.now();
+      await assert.rejects(openPayload(env, PASS), /kdf/);
+      assert.ok(Date.now() - t0 < 1000, "must reject before PBKDF2 (no DoS window)");
+    }
+  });
+  it("rewrapPayload rejects a tampered KDF the same way", async () => {
+    const envelope = await sealPayload(synthetic, PASS);
+    await assert.rejects(
+      rewrapPayload({ ...envelope, kdf: { ...envelope.kdf, iterations: 1 } }, PASS, PASS2),
+      /kdf/,
+    );
+    await assert.rejects(
+      rewrapPayload({ ...envelope, kdf: { ...envelope.kdf, salt: "" } }, PASS, PASS2),
+      /kdf/,
+    );
+  });
+  it("openPayload rejects wrong iv/wrapped lengths", async () => {
+    const envelope = await sealPayload(synthetic, PASS);
+    const b64 = (n) => Buffer.alloc(n, 7).toString("base64");
+    await assert.rejects(openPayload({ ...envelope, iv: b64(8) }, PASS), /iv/);
+    await assert.rejects(openPayload({ ...envelope, data: b64(4) }, PASS), /data/);
+    await assert.rejects(
+      openPayload({ ...envelope, wrappedKey: { ...envelope.wrappedKey, data: b64(32) } }, PASS),
+      /wrappedKey/,
+    );
+  });
+});

@@ -4,6 +4,6 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/sfa.test.js test/worker.test.js test/seal.test.js",
-    "build": "node --check src/sfa.js && node --check src/worker.js && node --check src/seal.js"
+    "build": "node --check src/sfa.js && node --check src/worker.js && node --check src/seal.js && node --check src/auth.js"
   }
 }

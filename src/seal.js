@@ -191,15 +191,43 @@ function assertV2Shape(envelope) {
   if (typeof envelope.iv !== "string" || typeof envelope.data !== "string") {
     throw new TypeError("[eigyo/seal] malformed v2 envelope (iv/data)");
   }
+  // Field lengths are fixed by e2ee-params.md §2: iv 12B, wrapped DEK
+  // 48B (32B DEK + 16B GCM tag), ciphertext at least a GCM tag (16B).
+  // Enforcing them here (before any KDF work) also bounds the work a
+  // server-supplied envelope can cause (see KDF fixation below).
+  const decoded = (label, value, check) => {
+    let bytes;
+    try {
+      bytes = b64decode(value);
+    } catch {
+      throw new TypeError(`[eigyo/seal] malformed v2 envelope (${label}: not base64)`);
+    }
+    if (!check(bytes.length)) {
+      throw new TypeError(`[eigyo/seal] malformed v2 envelope (${label}: bad length)`);
+    }
+    return bytes;
+  };
+  decoded("iv", envelope.iv, (n) => n === IV_BYTES);
+  decoded("data", envelope.data, (n) => n >= 16);
   const wk = envelope.wrappedKey;
   if (!wk || wk.alg !== SEAL_ALG || typeof wk.iv !== "string" || typeof wk.data !== "string") {
     throw new TypeError("[eigyo/seal] malformed v2 envelope (wrappedKey)");
   }
+  decoded("wrappedKey.iv", wk.iv, (n) => n === IV_BYTES);
+  decoded("wrappedKey.data", wk.data, (n) => n === 48);
   const kdf = envelope.kdf;
-  if (!kdf || kdf.name !== KDF_NAME || !Number.isInteger(kdf.iterations) || kdf.iterations <= 0 ||
+  if (!kdf || kdf.name !== KDF_NAME || !Number.isInteger(kdf.iterations) ||
       typeof kdf.salt !== "string") {
     throw new TypeError("[eigyo/seal] malformed v2 envelope (kdf)");
   }
+  // KDF FIXATION (review #3): iterations and salt are NOT taken from the
+  // envelope. Only the owner-approved parameters are accepted — anything
+  // else is rejected BEFORE deriveKek runs, so a stored envelope cannot
+  // make this client burn 30M iterations (DoS) or derive with a weak KDF.
+  if (kdf.iterations !== KDF_ITERATIONS) {
+    throw new TypeError("[eigyo/seal] malformed v2 envelope (kdf.iterations must be 600000)");
+  }
+  decoded("kdf.salt", kdf.salt, (n) => n === KDF_SALT_BYTES);
 }
 
 async function unwrapDek(envelope, passphrase, cryptoImpl) {

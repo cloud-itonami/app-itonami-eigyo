@@ -1,14 +1,40 @@
-// app-itonami-eigyo — Awai identity auth (did:key + Ed25519).
+// app-itonami-eigyo — Awai identity auth (did:key + Ed25519 via WebCrypto).
 //
-// WebCrypto has no Ed25519 in the runtimes this Worker runs in (Node
-// `node --test` and Cloudflare Workers alike), so verification is a small
-// pure-JS BigInt implementation with zero new dependencies. SHA-512 comes
-// from WebCrypto (`crypto.subtle.digest("SHA-512", …)`), which IS present
-// in both runtimes; only the curve arithmetic is hand-rolled. Signing is
-// included because the client side needs it (tests sign challenge
-// responses with generated keypairs). Verified against RFC 8032 test
-// vectors in test/worker.test.js. Dependency impact: none — plain JS,
-// BigInt, and WebCrypto SHA-512.
+// Ed25519 is WebCrypto ONLY (crypto.subtle importKey/sign/verify with
+// { name: "Ed25519" }). This runtime (Node `node --test` and Cloudflare
+// Workers) supports WebCrypto Ed25519: importKey("pkcs8"/"raw") and
+// verify work, at ~0.05 ms/verify (vs ~143 ms for a pure-JS BigInt
+// implementation, which exceeds the Workers Free 10 ms CPU cap). There
+// is NO pure-JS curve arithmetic in this file: no scalarMult, no modInv,
+// no secret-scalar code. Signing and verification are delegated to the
+// platform WebCrypto implementation, whose scalar operations are not
+// observable from JS and are not subject to JS-level timing leakage.
+// Private keys never reach the Worker; the Worker only holds public
+// keys (from dids), single-use nonces, and session ids in memory.
+// Kougi review points addressed here:
+//   K1 (non-constant-time scalarMult / Fermat modInv) — GONE: the pure-JS
+//      implementation is deleted. No secret-scalar arithmetic remains
+//      anywhere in this codebase (client or server); signing is
+//      WebCrypto-only.
+//   K2 (small-order / non-canonical public-key encodings) — WebCrypto
+//      Ed25519 verify is cofactorless in this runtime and ACCEPTS a
+//      forged signature under the identity (small-order) public key
+//      (measured: verify(identity, basepoint||S=1) === true), and it
+//      accepts non-canonical encodings at importKey time. WebCrypto
+//      alone therefore does NOT resolve K2. ed25519Verify below adds
+//      explicit public-data checks before delegating to WebCrypto:
+//      (a) public key and R must be canonical (y < p), (b) neither may
+//      be a known small-order (8-torsion) encoding (libsodium
+//      `ge25519_has_small_order` table, sign-bit twin included), and
+//      (c) S must be canonical (S < L). These checks operate only on
+//      public encodings; they use BigInt comparisons on public data,
+//      not secret scalars. With them, the identity forgery above is
+//      rejected (see test/worker.test.js K2 tests).
+//
+// TODO (item 8, out of scope this PR — pre-deploy, separate PR): nonces
+// and sessions are currently held in an isolate-local Map. Moving them
+// to D1/DO with an expiry sweep is pre-deploy work; until then an
+// isolate restart simply forces re-authentication (new challenge).
 //
 // Protocol:
 //   did:key:z<base58btc multicodec ed25519-pubkey>  (prefix bytes ed 01)
@@ -16,120 +42,16 @@
 //   POST /auth/verify    {did, nonce, signature}
 //     signature = base64(Ed25519-sign(canonical message)) where the
 //     canonical message is UTF-8 of  nonce||purpose||timestamp .
-//   verify issues a short-lived, DID-bound Bearer session token.
-// Private keys, passphrases, and KEKs are client-side only and NEVER reach
-// the Worker: the Worker holds public keys (from dids), single-use
-// nonces, and session tokens in memory, and nothing else — there is no
-// Worker secret for key material.
+//   verify issues a short-lived, DID-bound session id (5 minutes),
+//   presented via `x-did` + `x-session` headers (no Bearer, per owner
+//   decision — same as kokyaku).
+// Private keys, passphrases, and KEKs are client-side only and NEVER
+// reach the Worker.
 
-function sha512(bytes, cryptoImpl = globalThis.crypto) {
-  return cryptoImpl.subtle.digest("SHA-512", bytes).then((buf) => new Uint8Array(buf));
-}
-
-// ---- field arithmetic (mod p = 2^255 - 19) ----
-const Q = (1n << 255n) - 19n;
-const L = (1n << 252n) + 27742317777372353535851937790883648493n;
-
-function mod(a, n) {
-  const r = a % n;
-  return r >= 0n ? r : r + n;
-}
-
-function modPow(base, exp, m) {
-  let result = 1n;
-  let b = mod(base, m);
-  let e = exp;
-  while (e > 0n) {
-    if (e & 1n) result = (result * b) % m;
-    b = (b * b) % m;
-    e >>= 1n;
-  }
-  return result;
-}
-
-function modInv(a, m) {
-  return modPow(a, m - 2n, m);
-}
-
-const D = mod(-121665n * modInv(121666n, Q), Q);
-const I = modPow(2n, (Q - 1n) / 4n, Q); // sqrt(-1) mod q
-
-function xrecover(y, signBit) {
-  const yy = mod(y * y, Q);
-  const xx = mod((yy - 1n) * modInv(mod(D * yy + 1n, Q), Q), Q);
-  let x = modPow(xx, (Q + 3n) / 8n, Q);
-  if (mod(x * x - xx, Q) !== 0n) x = mod(x * I, Q);
-  if (mod(x * x - xx, Q) !== 0n) throw new Error("invalid point");
-  const isOdd = (x & 1n) === 1n;
-  // Ed25519 "negative" sign = odd x. Negate unless oddness matches sign.
-  if (isOdd !== (signBit === 1)) x = mod(-x, Q);
-  return x;
-}
-
-const BY = mod(4n * modInv(5n, Q), Q);
-const BASE = { x: xrecover(BY, 0), y: BY };
-
-function pointAdd(p1, p2) {
-  const x1x2 = mod(p1.x * p2.x, Q);
-  const y1y2 = mod(p1.y * p2.y, Q);
-  const t = mod(D * mod(x1x2 * y1y2, Q), Q);
-  const x3 = mod(mod(p1.x * p2.y + p2.x * p1.y, Q) * modInv(mod(1n + t, Q), Q), Q);
-  const y3 = mod(mod(y1y2 + x1x2, Q) * modInv(mod(1n - t, Q), Q), Q);
-  return { x: x3, y: y3 };
-}
-
-function scalarMult(point, scalar) {
-  let result = { x: 0n, y: 1n }; // identity
-  let addend = point;
-  let s = scalar;
-  while (s > 0n) {
-    if (s & 1n) result = pointAdd(result, addend);
-    addend = pointAdd(addend, addend);
-    s >>= 1n;
-  }
-  return result;
-}
-
-// ---- point / scalar encoding ----
-function intFromLeBytes(bytes) {
-  let value = 0n;
-  for (let i = bytes.length - 1; i >= 0; i--) value = (value << 8n) | BigInt(bytes[i]);
-  return value;
-}
-
-function intToLeBytes(value, length) {
-  const bytes = new Uint8Array(length);
-  let v = value;
-  for (let i = 0; i < length; i++) {
-    bytes[i] = Number(v & 0xffn);
-    v >>= 8n;
-  }
-  return bytes;
-}
-
-function encodePoint(point) {
-  const bytes = intToLeBytes(point.y, 32);
-  if ((point.x & 1n) === 1n) bytes[31] |= 0x80;
-  return bytes;
-}
-
-function decodePoint(bytes) {
-  if (bytes.length !== 32) throw new Error("invalid point encoding");
-  const yBytes = Uint8Array.from(bytes);
-  const signBit = (yBytes[31] >> 7) & 1;
-  yBytes[31] &= 0x7f;
-  const y = intFromLeBytes(yBytes);
-  const x = xrecover(y, signBit);
-  return { x, y };
-}
-
-function clampScalar(h32) {
-  const bytes = Uint8Array.from(h32);
-  bytes[0] &= 248;
-  bytes[31] &= 127;
-  bytes[31] |= 64;
-  return intFromLeBytes(bytes);
-}
+const PKCS8_ED25519_PREFIX = new Uint8Array([
+  0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+  0x04, 0x22, 0x04, 0x20,
+]);
 
 function concatBytes(...parts) {
   const total = parts.reduce((sum, p) => sum + p.length, 0);
@@ -142,75 +64,130 @@ function concatBytes(...parts) {
   return out;
 }
 
-// ---- Ed25519 (RFC 8032) ----
-async function expandSeed(seed32, cryptoImpl) {
-  const h = await sha512(seed32, cryptoImpl);
-  return {
-    scalar: clampScalar(h.slice(0, 32)),
-    prefix: h.slice(32, 64),
-  };
+function b64urlToBytes(text) {
+  const b64 = text.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = b64.padEnd(Math.ceil(b64.length / 4) * 4, "=");
+  const bin = atob(padded);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
 }
 
-// 32-byte seed -> { publicKey: Uint8Array(32) }
+// ---- public-encoding validity (K2): canonical y, small-order, canonical S ----
+// p = 2^255 - 19, L = 2^252 + 27742317777372353535851937790883648493
+const P = (1n << 255n) - 19n;
+const L = (1n << 252n) + 27742317777372353535851937790883648493n;
+
+function intFromLeBytes(bytes) {
+  let value = 0n;
+  for (let i = bytes.length - 1; i >= 0; i--) value = (value << 8n) | BigInt(bytes[i]);
+  return value;
+}
+
+function yOfEncoding(bytes32) {
+  const yBytes = Uint8Array.from(bytes32);
+  yBytes[31] &= 0x7f; // strip x sign bit
+  return intFromLeBytes(yBytes);
+}
+
+function isCanonicalEncoding(bytes32) {
+  if (!(bytes32 instanceof Uint8Array) || bytes32.length !== 32) return false;
+  return yOfEncoding(bytes32) < P;
+}
+
+// libsodium `ge25519_has_small_order` (ref10) canonical 8-torsion encodings;
+// the sign-bit twin (last byte | 0x80) is the same point and equally banned.
+const SMALL_ORDER_HEX = [
+  "0000000000000000000000000000000000000000000000000000000000000000",
+  "0100000000000000000000000000000000000000000000000000000000000000",
+  "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+  "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+  "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+];
+const SMALL_ORDER_PREFIX31 = SMALL_ORDER_HEX.map((h) => h.slice(0, 62));
+const SMALL_ORDER_LAST7 = SMALL_ORDER_HEX.map((h) => parseInt(h.slice(62, 64), 16) & 0x7f);
+
+export function isSmallOrderEncoding(bytes32) {
+  if (!(bytes32 instanceof Uint8Array) || bytes32.length !== 32) return false;
+  const hex = [...bytes32].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const prefix = hex.slice(0, 62);
+  const last = bytes32[31] & 0x7f;
+  for (let i = 0; i < SMALL_ORDER_PREFIX31.length; i++) {
+    if (prefix === SMALL_ORDER_PREFIX31[i] && last === SMALL_ORDER_LAST7[i]) return true;
+  }
+  return false;
+}
+
+export function isCanonicalPublicKey(bytes32) {
+  return isCanonicalEncoding(bytes32) && !isSmallOrderEncoding(bytes32);
+}
+
+function isCanonicalS(signature) {
+  const s = intFromLeBytes(signature.slice(32, 64));
+  return s >= 0n && s < L;
+}
+
+// ---- Ed25519 via WebCrypto ----
+async function importPrivateFromSeed(seed32, cryptoImpl) {
+  if (!(seed32 instanceof Uint8Array) || seed32.length !== 32) {
+    throw new RangeError("[eigyo/auth] ed25519 seed must be 32 bytes");
+  }
+  const der = concatBytes(PKCS8_ED25519_PREFIX, seed32);
+  return cryptoImpl.subtle.importKey("pkcs8", der, { name: "Ed25519" }, true, ["sign"]);
+}
+
+// 32-byte seed -> 32-byte public key, via WebCrypto (private JWK `x`).
 export async function ed25519PublicKeyFromSeed(seed32, cryptoImpl = globalThis.crypto) {
-  if (!(seed32 instanceof Uint8Array) || seed32.length !== 32) {
-    throw new RangeError("[eigyo/auth] ed25519 seed must be 32 bytes");
+  const priv = await importPrivateFromSeed(seed32, cryptoImpl);
+  const jwk = await cryptoImpl.subtle.exportKey("jwk", priv);
+  if (!jwk || typeof jwk.x !== "string") {
+    throw new Error("[eigyo/auth] WebCrypto did not return Ed25519 public JWK");
   }
-  const { scalar } = await expandSeed(seed32, cryptoImpl);
-  return encodePoint(scalarMult(BASE, scalar));
+  const publicKey = b64urlToBytes(jwk.x);
+  if (publicKey.length !== 32) throw new Error("[eigyo/auth] bad Ed25519 public key length");
+  return publicKey;
 }
 
-// Sign message with a 32-byte seed (private key). Returns the 64-byte
-// signature (RFC 8032 deterministic nonce scheme).
+// Sign message with a 32-byte seed (private key). Returns 64-byte signature.
 export async function ed25519Sign(seed32, message, cryptoImpl = globalThis.crypto) {
-  if (!(seed32 instanceof Uint8Array) || seed32.length !== 32) {
-    throw new RangeError("[eigyo/auth] ed25519 seed must be 32 bytes");
-  }
   const msg = message instanceof Uint8Array ? message : new TextEncoder().encode(String(message));
-  const { scalar, prefix } = await expandSeed(seed32, cryptoImpl);
-  const publicKey = encodePoint(scalarMult(BASE, scalar));
-  const r = mod(intFromLeBytes(await sha512(concatBytes(prefix, msg), cryptoImpl)), L);
-  const rEncoded = encodePoint(scalarMult(BASE, r));
-  const k = mod(intFromLeBytes(await sha512(concatBytes(rEncoded, publicKey, msg), cryptoImpl)), L);
-  const s = mod(r + mod(k * scalar, L), L);
-  return concatBytes(rEncoded, intToLeBytes(s, 32));
+  const priv = await importPrivateFromSeed(seed32, cryptoImpl);
+  return new Uint8Array(await cryptoImpl.subtle.sign({ name: "Ed25519" }, priv, msg));
 }
 
 // Verify a 64-byte signature against a 32-byte public key. Any malformed
 // input or failed equation returns false (never throws for bad sigs).
+// Public-encoding checks (K2) run before WebCrypto verify, because the
+// platform verify is cofactorless and accepts small-order forgeries.
 export async function ed25519Verify(publicKey, message, signature, cryptoImpl = globalThis.crypto) {
   try {
     if (!(publicKey instanceof Uint8Array) || publicKey.length !== 32) return false;
     if (!(signature instanceof Uint8Array) || signature.length !== 64) return false;
+    if (!isCanonicalPublicKey(publicKey)) return false;
+    if (!isCanonicalEncoding(signature.slice(0, 32))) return false;
+    if (isSmallOrderEncoding(signature.slice(0, 32))) return false;
+    if (!isCanonicalS(signature)) return false;
     const msg = message instanceof Uint8Array ? message : new TextEncoder().encode(String(message));
-    const rEncoded = signature.slice(0, 32);
-    const sBytes = signature.slice(32, 64);
-    const s = intFromLeBytes(sBytes);
-    if (s >= L || s < 0n) return false;
-    const aPoint = decodePoint(publicKey);
-    const rPoint = decodePoint(rEncoded);
-    const k = intFromLeBytes(await sha512(concatBytes(rEncoded, publicKey, msg), cryptoImpl));
-    const left = encodePoint(scalarMult(BASE, s));
-    const right = encodePoint(pointAdd(rPoint, scalarMult(aPoint, mod(k, L))));
-    return bytesEqual(left, right);
+    const key = await cryptoImpl.subtle.importKey("raw", publicKey, { name: "Ed25519" }, false, ["verify"]);
+    return await cryptoImpl.subtle.verify({ name: "Ed25519" }, key, signature, msg);
   } catch {
     return false;
   }
 }
 
-function bytesEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
-}
-
 // Generate a fresh seed + public key (client-side only; the seed is the
 // private key and is never sent to the Worker).
 export async function ed25519GenerateKeypair(cryptoImpl = globalThis.crypto) {
-  const seed = cryptoImpl.getRandomValues(new Uint8Array(32));
-  const publicKey = await ed25519PublicKeyFromSeed(seed, cryptoImpl);
-  return { seed, publicKey };
+  const keypair = await cryptoImpl.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  const publicKey = new Uint8Array(await cryptoImpl.subtle.exportKey("raw", keypair.publicKey));
+  const pkcs8 = new Uint8Array(await cryptoImpl.subtle.exportKey("pkcs8", keypair.privateKey));
+  if (publicKey.length !== 32 || pkcs8.length !== 48) {
+    throw new Error("[eigyo/auth] unexpected Ed25519 key export length");
+  }
+  const seed = pkcs8.slice(-32);
+  return { seed: new Uint8Array(seed), publicKey };
 }
 
 // ---- base58btc (Bitcoin alphabet) ----
@@ -274,7 +251,7 @@ export function didToPubkey(did) {
 // ---- challenge / verify / session service ----
 export const AUTH_PURPOSE = "eigyo:auth:login";
 export const NONCE_TTL_MS = 5 * 60 * 1000; // single-use, short-lived
-export const SESSION_TTL_MS = 30 * 60 * 1000; // short-lived, DID-bound
+export const SESSION_TTL_MS = 5 * 60 * 1000; // short-lived, DID-bound (5 min, same as nonce)
 
 export function canonicalAuthMessage({ nonce, purpose, timestamp }) {
   return `${nonce}||${purpose}||${timestamp}`;
@@ -292,8 +269,10 @@ function bytesToHex(bytes) {
 }
 
 export function createAuthService({ now = () => Date.now(), cryptoImpl = globalThis.crypto } = {}) {
+  // TODO(item 8): isolate-local Maps — move nonces/sessions to D1/DO with
+  // expiry sweep in a separate pre-deploy PR (see header comment).
   const nonces = new Map(); // nonce -> challenge record
-  const sessions = new Map(); // token -> { did, expiresAtMs }
+  const sessions = new Map(); // session id -> { did, expiresAtMs }
 
   function randomHex(byteCount) {
     return bytesToHex(cryptoImpl.getRandomValues(new Uint8Array(byteCount)));
@@ -355,21 +334,24 @@ export function createAuthService({ now = () => Date.now(), cryptoImpl = globalT
     const message = canonicalAuthMessage(record);
     const valid = await ed25519Verify(publicKey, new TextEncoder().encode(message), sigBytes, cryptoImpl);
     if (!valid) return { ok: false, error: "auth-failed" };
-    const token = randomHex(32);
+    const session = randomHex(32);
     const expiresAtMs = now() + SESSION_TTL_MS;
-    sessions.set(token, { did, expiresAtMs });
-    return { ok: true, token, did, expiresAt: new Date(expiresAtMs).toISOString() };
+    sessions.set(session, { did, expiresAtMs });
+    return { ok: true, session, did, expiresAt: new Date(expiresAtMs).toISOString() };
   }
 
-  function getSession(token) {
-    if (typeof token !== "string" || !token) return null;
-    const session = sessions.get(token);
-    if (!session) return null;
-    if (now() > session.expiresAtMs) {
-      sessions.delete(token);
+  // getSession(sessionId, did?) — when did is given, the session must be
+  // bound to that DID (x-did + x-session), otherwise null.
+  function getSession(session, did) {
+    if (typeof session !== "string" || !session) return null;
+    const record = sessions.get(session);
+    if (!record) return null;
+    if (now() > record.expiresAtMs) {
+      sessions.delete(session);
       return null;
     }
-    return session.did;
+    if (did !== undefined && did !== null && record.did !== did) return null;
+    return record.did;
   }
 
   return { issueChallenge, verifyResponse, getSession, _stores: { nonces, sessions } };

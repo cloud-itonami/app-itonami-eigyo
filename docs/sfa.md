@@ -214,8 +214,15 @@ real D1 database (wrangler keeps the zero-UUID placeholder), **no
 - Rotation = re-wrap DEK only (`rewrapPayload`: data untouched).
 - DEK rotation = re-seal (`resealPayload`: fresh DEK + ciphertext).
 - v1 → v2 migration (`migrateToV2`: open v1 with the legacy key, re-seal
-  as v2). v1 stays openable until migration is done; v1 envelopes remain
-  acceptable to `POST /records` during the migration window.
+  as v2). v1 stays openable client-side until migration is done, but
+  `POST /records` accepts **v2 only** — v1 is never a new save (review #2).
+  Envelopes are rebuilt from allowlisted keys only and validated strictly
+  server-side: unknown keys → 400, base64 + fixed lengths
+  (iv 12B, salt 16B, wrapped DEK 48B = 32B DEK + 16B GCM tag, data ≥ 16B),
+  record id must be server-issued (`record_<32 hex>`) or UUID (review #1).
+  KDF is fixed at 600,000 iterations / 16B salt in both the Worker and
+  the client `openPayload`/`rewrapPayload` — envelope-supplied iterations
+  are never followed (review #3, no 30M-iteration DoS).
 - Wrong passphrase / tampered ciphertext → AES-GCM auth failure, no
   plaintext ever returned (negative controls a–d).
 - Key-loss = data-loss: if the passphrase/seed is lost, the sealed data is
@@ -226,7 +233,7 @@ real D1 database (wrangler keeps the zero-UUID placeholder), **no
 
 ```text
 POST /auth/challenge {did}           -> 201 {did, nonce, purpose, timestamp, expiresAt} | 400 invalid-did
-POST /auth/verify {did, nonce, signature} -> 200 {token, did, expiresAt} | 401 auth-failed
+POST /auth/verify {did, nonce, signature} -> 200 {session, did, expiresAt} | 401 auth-failed
 ```
 
 - `did:key:z<base58btc multicodec ed25519-pubkey>` (prefix bytes `ed 01`).
@@ -234,16 +241,28 @@ POST /auth/verify {did, nonce, signature} -> 200 {token, did, expiresAt} | 401 a
   `nonce||purpose||timestamp` (`purpose = eigyo:auth:login`) with its
   Ed25519 private key; the Worker verifies against the public key only.
 - Nonces are single-use (consumed on the first verify attempt) and live
-  **5 minutes**; sessions are 30-minute DID-bound Bearers
-  (`Authorization: Bearer <token>`). Sessions are held in Worker memory in
+  **5 minutes**; sessions are **5-minute** DID-bound sessions presented
+  via `x-did` + `x-session` headers (owner decision: no Bearer, same as
+  kokyaku; review #5). The session is bound to the presented DID — a
+  mismatched `x-did` answers 401. Sessions are held in Worker memory in
   this skeleton — if an isolate restarts, clients simply re-authenticate
   (a new challenge/verify). There is no Worker secret for key material.
-- **Ed25519 choice:** WebCrypto has no Ed25519 in these runtimes, so the
-  verify (and, for clients/tests, sign) is a small pure-JS BigInt
-  implementation with **zero new dependencies**; SHA-512 comes from
-  WebCrypto, present in Cloudflare Workers and Node alike. Verified
-  against RFC 8032 vectors and cross-checked against native Node Ed25519
-  in `test/worker.test.js`.
+  TODO (item 8, out of scope this PR): nonces/sessions are isolate-local
+  `Map`s; moving them to D1/DO with an expiry sweep is pre-deploy work
+  for a separate PR.
+- **Ed25519 choice:** WebCrypto only (`crypto.subtle` Ed25519
+  importKey/sign/verify, ~0.05 ms/verify). The former pure-JS BigInt
+  implementation is **deleted** (review #4): it measured ~143 ms/verify,
+  exceeding the Workers Free 10 ms CPU cap. There is no secret-scalar
+  code left anywhere (Kougi K1 — the non-constant-time scalar code is
+  gone; signing is platform WebCrypto only). WebCrypto verify in this
+  runtime is cofactorless and accepts small-order forgeries, so
+  `ed25519Verify` adds explicit public-data checks first: canonical
+  encodings (`y < p`, `S < L`) and the libsodium small-order (8-torsion)
+  blocklist for both the public key and `R` (Kougi K2 — verified by the
+  identity-forgery and `y+p`/`S+L` tests in `test/worker.test.js`).
+  Verified against RFC 8032 vectors and cross-checked against native
+  Node Ed25519 in `test/worker.test.js`.
 - Private keys, passphrases and KEKs **never** reach the Worker — there is
   no Worker secret, log line, or route for them (negative control e).
 
@@ -281,15 +300,17 @@ the store operator; content does not (see §10.5).
 ### 11.5 Records endpoints + client-side search/report
 
 ```text
-POST /records  (auth) {id?, cid?, envelope, seq?} -> 201 metadata | 400 | 401 | 409
-GET  /records  (auth)                            -> 200 {items:[metadata…]} (own DID only)
-GET  /records/:id (auth)                         -> 200 record | 404 | 401
-GET  /health, GET /ipfs/<cid>                    unchanged (missing -> 404 never 500; bad CID -> 400)
+POST /records  (x-did+x-session) {id?, cid?, envelope, seq?} -> 201 metadata | 400 | 401 | 409 | 503
+GET  /records  (x-did+x-session) -> 200 {items:[metadata…]} (own DID only) | 401 | 503
+GET  /records/:id (x-did+x-session) -> 200 record | 404 | 401 | 400 | 503
+GET  /health, GET /ipfs/<cid>    unchanged (missing -> 404 never 500; bad CID -> 400; malformed %-encoding -> 400, never a thrown URIError)
 ```
 
-- Envelope shape is validated server-side (v1 or v2); the Worker cannot
-  and does not decrypt. Other owners' records answer **404** (existence is
-  not leaked).
+- Envelope shape is validated server-side (**v2 only** on POST; rebuilt
+  from allowlisted keys — unknown keys → 400); the Worker cannot and
+  does not decrypt. Other owners' records answer **404** (existence is
+  not leaked). A D1 constraint violation answers **409**; any other D1
+  failure answers **503**, never a false 409 (review #6).
 - Server-side plaintext search/report is **removed by design**: `GET
   /records` returns metadata only (never envelopes). The record list is
   what clients fetch; clients decrypt with the passphrase and run
@@ -310,6 +331,10 @@ f) HTTP contracts preserved: missing object 404 never 500, bad CID 400,
 
 ### 11.7 Out of scope
 
+- Item 8 (pre-deploy, separate PR — not in this PR): nonces/sessions are
+  isolate-local `Map`s. Moving them to D1/DO with an expiry sweep is
+  required before deploy; this PR does not block items 1–7 on it and
+  leaves a TODO in `src/auth.js` / `src/worker.js`.
 - No D1 database creation, no paid services, no additional bindings.
 - No `kotoba/*` or `MIGRATION-TODO.md` changes.
 - No server escrow / password reset (by design — §11.1).
