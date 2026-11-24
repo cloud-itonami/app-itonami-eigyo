@@ -68,6 +68,12 @@ answers `unknown-stage`; an unknown id answers `not-found`.
 | `member` (default) | only rows with `ownerId === userId`; without `userId`, nothing |
 | anything else | treated as `member` |
 
+> **Superseded by E2EE stage-2 (§11).** The `role`/`userId` query-param trust
+> above is **removed**: protected routes now require a verified session and
+> the owner scope is the verified DID. The plaintext accounts/opportunities/
+> report routes are gone; `src/sfa.js` survives only as the client-side
+> library that runs search/report over **decrypted** data.
+
 Auth is a skeleton placeholder — `ownerId`/`userId` arrive as request
 fields/query params and are not verified yet. No credentials in repo.
 
@@ -86,15 +92,19 @@ from `createdAt`. `?quarter=YYYY-Qn` filters the quarterly rows.
 
 ## 7. HTTP surface
 
+> **Stage-2 surface: see §11.** The plaintext routes below are **removed**;
+> the current Worker exposes `/auth/*` + `/records*` (verified sessions,
+> sealed envelopes). The statuses shown are the historical skeleton shape.
+
 ```text
 GET  /health                         {ok, service:"app-itonami-eigyo", storage:"yataverse", r2:false}
 GET  /ipfs/<cid>                     yataverse proxy (missing object -> 404 never 500; bad CID -> 400)
-POST /accounts   {name}              -> 201 account | 400
-GET  /accounts?q=                    {items:[…]}
-POST /opportunities {name, amount>=0, probability 0..100, accountId, ownerId?} -> 201 | 400
-GET  /opportunities?q=&stage=&role=&userId=   {items:[…]} (role-scoped)
-POST /opportunities/:id/transition {to}        -> 200 | 400 | 404
-GET  /report?role=&userId=&quarter=  {byStage, quarterly, scope}
+POST /accounts   {name}              -> 201 account | 400              (removed)
+GET  /accounts?q=                    {items:[…]}                       (removed)
+POST /opportunities {name, amount>=0, probability 0..100, accountId, ownerId?} -> 201 | 400 (removed)
+GET  /opportunities?q=&stage=&role=&userId=   {items:[…]} (role-scoped)  (removed)
+POST /opportunities/:id/transition {to}        -> 200 | 400 | 404        (removed)
+GET  /report?role=&userId=&quarter=  {byStage, quarterly, scope}         (removed)
 ```
 
 ## 8. Constraints (owner policy 2026-11-23)
@@ -171,3 +181,136 @@ repo, docs, or PRs. All tests use synthetic payloads
 - The in-memory Worker store (skeleton) holds **plaintext**
   opportunities at runtime; it is a local demo surface, not a data
   store. Persisted ciphertext is the sealed envelope, never plaintext.
+  *(Stage-2: the plaintext store is retired as a persistence path — §11.3.)*
+
+## 11. E2EE stage-2 — sealed records + did:key auth (owner-approved)
+
+Owner-approved parameters (do not re-decide): PBKDF2-HMAC-SHA256
+600,000 iterations + 128-bit header salt; envelope v2 with per-object
+DEKs; D1 = ciphertext + metadata only; Awai identity `did:key`
+challenge/verify. This section is the stage-2 spec; `src/seal.js`,
+`src/worker.js`, `src/auth.js`, `schema.sql`, `test/*.js` implement it.
+`kotoba/*` and `MIGRATION-TODO.md` are untouched. No paid resources, no
+real D1 database (wrangler keeps the zero-UUID placeholder), **no
+`r2_buckets`**.
+
+### 11.1 Envelope v2 (`src/seal.js`)
+
+| part | value |
+|---|---|
+| KDF | PBKDF2-HMAC-SHA256, **600,000** iterations, **128-bit** random salt in the header (non-secret) |
+| DEK | per-object random **256-bit**, AES-256-GCM, one per sealed payload |
+| KEK | 256-bit key derived via that KDF from the user passphrase (client only) |
+| wrap | DEK wrapped with the KEK (AES-256-GCM), stored as `wrappedKey` |
+| AAD | `eigyo:opportunity:v2` (key-wrap uses `eigyo:opportunity:v2:wrap`) |
+
+```json
+{ "v": 2, "alg": "AES-256-GCM",
+  "iv": "<b64 12B>", "data": "<b64 ciphertext>",
+  "wrappedKey": { "alg": "AES-256-GCM", "iv": "<b64 12B>", "data": "<b64 wrapped DEK>" },
+  "kdf": { "name": "PBKDF2-HMAC-SHA256", "iterations": 600000, "salt": "<b64 16B>" } }
+```
+
+- Rotation = re-wrap DEK only (`rewrapPayload`: data untouched).
+- DEK rotation = re-seal (`resealPayload`: fresh DEK + ciphertext).
+- v1 → v2 migration (`migrateToV2`: open v1 with the legacy key, re-seal
+  as v2). v1 stays openable until migration is done; v1 envelopes remain
+  acceptable to `POST /records` during the migration window.
+- Wrong passphrase / tampered ciphertext → AES-GCM auth failure, no
+  plaintext ever returned (negative controls a–d).
+- Key-loss = data-loss: if the passphrase/seed is lost, the sealed data is
+  **unrecoverable** — there is no reset, no escrow, no server recovery by
+  design. Custody is the user's responsibility.
+
+### 11.2 Auth — Awai identity `did:key` (`src/auth.js`, `src/worker.js`)
+
+```text
+POST /auth/challenge {did}           -> 201 {did, nonce, purpose, timestamp, expiresAt} | 400 invalid-did
+POST /auth/verify {did, nonce, signature} -> 200 {token, did, expiresAt} | 401 auth-failed
+```
+
+- `did:key:z<base58btc multicodec ed25519-pubkey>` (prefix bytes `ed 01`).
+- The client signs the canonical UTF-8 message
+  `nonce||purpose||timestamp` (`purpose = eigyo:auth:login`) with its
+  Ed25519 private key; the Worker verifies against the public key only.
+- Nonces are single-use (consumed on the first verify attempt) and live
+  **5 minutes**; sessions are 30-minute DID-bound Bearers
+  (`Authorization: Bearer <token>`). Sessions are held in Worker memory in
+  this skeleton — if an isolate restarts, clients simply re-authenticate
+  (a new challenge/verify). There is no Worker secret for key material.
+- **Ed25519 choice:** WebCrypto has no Ed25519 in these runtimes, so the
+  verify (and, for clients/tests, sign) is a small pure-JS BigInt
+  implementation with **zero new dependencies**; SHA-512 comes from
+  WebCrypto, present in Cloudflare Workers and Node alike. Verified
+  against RFC 8032 vectors and cross-checked against native Node Ed25519
+  in `test/worker.test.js`.
+- Private keys, passphrases and KEKs **never** reach the Worker — there is
+  no Worker secret, log line, or route for them (negative control e).
+
+### 11.3 Storage — D1 `sealed_records` only
+
+`schema.sql` is exactly:
+
+```sql
+CREATE TABLE sealed_records (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, cid TEXT, envelope TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX idx_sealed_owner ON sealed_records(owner_id);
+```
+
+- Old `accounts`/`opportunities` tables are removed. The Worker uses
+  `env.EIGYO_DB` when the binding exists; with no binding (`node --test`,
+  wrangler dev without D1) a clearly-marked **DEMO** in-memory fallback
+  holds sealed envelopes only — never plaintext — so handlers can be
+  exercised. The plaintext store is **no longer a persistence path**.
+- wrangler.jsonc keeps the zero-UUID placeholder. No real D1 database is
+  created; `grep -c '"r2_buckets"' wrangler.jsonc` must print `0`.
+
+### 11.4 Metadata leakage (per column — all non-confidential)
+
+| column | content | confidentiality |
+|---|---|---|
+| `id` | opaque record key (`record_…`) | non-confidential |
+| `owner_id` | the owner's DID (a public identifier) | non-confidential |
+| `cid` | content-addressed link, if supplied | non-confidential (blob linkage) |
+| `envelope` | the opaque v1/v2 envelope | non-confidential **as ciphertext** (readable only with the passphrase) |
+| `seq` | client ordering hint | non-confidential |
+| `created_at`, `updated_at` | store-op timestamps | non-confidential (sync pattern only) |
+
+Existence/count of rows, fetch patterns, and timestamps remain visible to
+the store operator; content does not (see §10.5).
+
+### 11.5 Records endpoints + client-side search/report
+
+```text
+POST /records  (auth) {id?, cid?, envelope, seq?} -> 201 metadata | 400 | 401 | 409
+GET  /records  (auth)                            -> 200 {items:[metadata…]} (own DID only)
+GET  /records/:id (auth)                         -> 200 record | 404 | 401
+GET  /health, GET /ipfs/<cid>                    unchanged (missing -> 404 never 500; bad CID -> 400)
+```
+
+- Envelope shape is validated server-side (v1 or v2); the Worker cannot
+  and does not decrypt. Other owners' records answer **404** (existence is
+  not leaked).
+- Server-side plaintext search/report is **removed by design**: `GET
+  /records` returns metadata only (never envelopes). The record list is
+  what clients fetch; clients decrypt with the passphrase and run
+  search/report (`src/sfa.js`) over plaintext locally.
+
+### 11.6 Negative-control tests (synthetic data only)
+
+a–f live in `test/seal.test.js` + `test/worker.test.js`:
+
+a) seal → store/fetch → open matches (`Synthetic Deal Alpha`).
+b) wrong passphrase/key fails open, no plaintext returned.
+c) 1-byte tamper → AES-GCM auth failure (data and wrappedKey).
+d) stored ciphertext contains no plaintext substring (0 hits, decoded bytes too).
+e) no key material in repo/logs: source grep (key blocks, secret literals,
+   `console.log`, role/userId trust) prints nothing.
+f) HTTP contracts preserved: missing object 404 never 500, bad CID 400,
+   `wrangler.jsonc` has no `r2_buckets`. Synthetic data only; no real data.
+
+### 11.7 Out of scope
+
+- No D1 database creation, no paid services, no additional bindings.
+- No `kotoba/*` or `MIGRATION-TODO.md` changes.
+- No server escrow / password reset (by design — §11.1).
+- No server-side full-text search or reports over plaintext (by design — §11.5).
