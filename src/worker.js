@@ -23,8 +23,10 @@
 //   Lifetimes: challenge nonce 5 minutes AND session 5 minutes.
 //   Nonces/sessions live in D1 as SHA-256 hashes only; single-use is an
 //   atomic UPDATE...WHERE used=0 AND expires_at>now (meta.changes === 1);
-//   expired rows are swept on the challenge/verify paths; unauthenticated
-//   challenge issuance is capped per-DID and globally (429).
+//   expired rows are swept on the challenge/verify paths; tables beyond
+//   10,000 rows are trimmed oldest-first (never rejected). Issuance
+//   throttling is the AUTH_RATE_LIMIT Cloudflare Rate Limiting binding
+//   keyed by client IP (never stored in D1); it is not counted by DID.
 // - Missing objects answer 404, never 500 (cf. no-r2-yataverse-only.md);
 //   bad CID -> 400 before any fetch runs; malformed %-encoding -> 400,
 //   never a thrown URIError. D1 constraint violation -> 409, any other
@@ -38,7 +40,7 @@
 // HTTP surface (see docs/sfa.md §7/§11):
 //   GET  /health
 //   GET  /ipfs/<cid>                       yataverse proxy (public)
-//   POST /auth/challenge  {did}            -> 201 {nonce, purpose, timestamp} | 400 | 429 | 503
+//   POST /auth/challenge  {did}            -> 201 {nonce, purpose, timestamp} | 400 | 429 (rate-limit binding) | 503
 //   POST /auth/verify     {did, nonce, signature} -> 200 {session, did, expiresAt} | 401 | 503
 //   POST /records         (x-did+x-session) {id?, cid?, envelope, seq?} -> 201 metadata | 400 | 401 | 409 | 503
 //   GET  /records         (x-did+x-session) -> 200 {items:[metadata...]} (own only) | 401 | 503
@@ -220,21 +222,41 @@ async function allocateSeq(db, ownerId) {
 async function storeRecord(env, row) {
   const db = env?.EIGYO_DB;
   if (!db) return { ok: false, error: "unavailable" };
-  try {
-    // Server-allocated seq is authoritative: the optional client seq is
-    // validated for shape only (see POST /records) and never trusted to
-    // be unique.
-    const seq = await allocateSeq(db, row.owner_id);
-    await db.prepare(
-      "INSERT INTO sealed_records (id, owner_id, cid, envelope, seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    ).bind(row.id, row.owner_id, row.cid ?? null, row.envelope, seq, row.created_at, row.updated_at).run();
-    return { ok: true, seq };
-  } catch (err) {
-    // Duplicate = constraint violation ONLY (#6); every other D1 failure
-    // is a store outage (503), never a false 409.
-    if (isConstraintViolation(err)) return { ok: false, error: "exists" };
-    return { ok: false, error: "unavailable" };
+  // Server-allocated seq is authoritative: the optional client seq is
+  // validated for shape only (see POST /records) and never trusted to
+  // be unique. UNIQUE(owner_id, seq) is the backstop: if the counter
+  // ever hands out a seq that already exists (e.g. a lagging counter),
+  // retry with a fresh allocation instead of failing the write.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let seq;
+    try {
+      seq = await allocateSeq(db, row.owner_id);
+      await db.prepare(
+        "INSERT INTO sealed_records (id, owner_id, cid, envelope, seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ).bind(row.id, row.owner_id, row.cid ?? null, row.envelope, seq, row.created_at, row.updated_at).run();
+      return { ok: true, seq };
+    } catch (err) {
+      // Duplicate = constraint violation ONLY (#6); every other D1 failure
+      // is a store outage (503), never a false 409.
+      if (!isConstraintViolation(err)) return { ok: false, error: "unavailable" };
+      // Only a (owner_id, seq) collision is retryable; an id constraint
+      // (or an unspecified one) is a true duplicate.
+      if (!String(err?.message ?? err).includes("owner_id")) {
+        return { ok: false, error: "exists" };
+      }
+      // A constraint hit on an id that is already stored is a true
+      // duplicate (409); any other constraint hit is a seq collision —
+      // allocate a fresh seq and retry.
+      let existing = null;
+      try {
+        existing = await db.prepare("SELECT id FROM sealed_records WHERE id = ?").bind(row.id).first();
+      } catch {
+        return { ok: false, error: "unavailable" };
+      }
+      if (existing) return { ok: false, error: "exists" };
+    }
   }
+  return { ok: false, error: "unavailable" };
 }
 
 async function fetchRecordById(env, id) {
@@ -269,12 +291,32 @@ export async function fetchHandler(request, env, fetchImpl = fetch) {
 
   if (request.method === "POST" && path === "/auth/challenge") {
     if (!env?.EIGYO_DB) return json({ error: "store-unavailable" }, 503);
+    // Issuance throttling: Cloudflare Rate Limiting binding keyed by
+    // client IP (the IP is never stored in D1). When the binding exists
+    // its decision is passed through as-is — the Worker never counts
+    // DIDs or builds its own 429. Without the binding there is no limit
+    // (that absence is logged, not silently skipped).
+    const rateLimit = env?.AUTH_RATE_LIMIT;
+    if (rateLimit) {
+      const ip = request.headers?.get("cf-connecting-ip") ||
+        request.headers?.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+        "unknown";
+      let decision;
+      try {
+        decision = await rateLimit.limit({ key: ip });
+      } catch {
+        decision = null; // a broken limiter must not lock out issuance
+      }
+      if (decision instanceof Response) return decision;
+      if (decision && decision.success === false) return json({ error: "rate-limited" }, 429);
+    } else {
+      console.warn("[eigyo] AUTH_RATE_LIMIT binding absent; challenge issuance is not rate limited");
+    }
     const body = await request.json().catch(() => null);
     const result = await createAuthService({ db: env.EIGYO_DB }).issueChallenge(
       typeof body?.did === "string" ? body.did : "",
     );
     if (!result.ok) {
-      if (result.error === "rate-limited") return json({ error: "rate-limited" }, 429);
       if (result.error === "store-unavailable") return json({ error: "store-unavailable" }, 503);
       return json({ error: "invalid-did" }, 400);
     }

@@ -32,9 +32,28 @@ export function createFakeD1() {
       }
       return { success: true, meta: { changes } };
     }
-    if (s.startsWith("DELETE FROM sessions WHERE session_hash")) {
+    if (s.startsWith("DELETE FROM sessions WHERE session_hash = ?")) {
       const changes = tables.sessions.delete(params[0]) ? 1 : 0;
       return { success: true, meta: { changes } };
+    }
+    // --- table trim (oldest-first beyond the row cap; never rejects) ---
+    if (s.startsWith("DELETE FROM challenges WHERE nonce_hash IN")) {
+      const excess = params[0];
+      const oldest = [...tables.challenges.values()].sort((a, b) => a.created_at - b.created_at).slice(0, excess);
+      for (const row of oldest) tables.challenges.delete(row.nonce_hash);
+      return { success: true, meta: { changes: oldest.length } };
+    }
+    if (s.startsWith("DELETE FROM sessions WHERE session_hash IN")) {
+      const excess = params[0];
+      const oldest = [...tables.sessions.values()].sort((a, b) => a.created_at - b.created_at).slice(0, excess);
+      for (const row of oldest) tables.sessions.delete(row.session_hash);
+      return { success: true, meta: { changes: oldest.length } };
+    }
+    if (s === "SELECT COUNT(*) AS n FROM challenges") {
+      return mode === "all" ? { success: true, results: [{ n: tables.challenges.size }] } : { n: tables.challenges.size };
+    }
+    if (s === "SELECT COUNT(*) AS n FROM sessions") {
+      return mode === "all" ? { success: true, results: [{ n: tables.sessions.size }] } : { n: tables.sessions.size };
     }
     // --- challenge issuance caps ---
     if (s.startsWith("SELECT COUNT(*) AS n FROM challenges WHERE did")) {
@@ -95,6 +114,12 @@ export function createFakeD1() {
     if (s.startsWith("INSERT INTO sealed_records")) {
       const [id, owner_id, cid, envelope, seq, created_at, updated_at] = params;
       if (tables.sealed_records.has(id)) throw new Error("UNIQUE constraint failed: sealed_records.id");
+      // UNIQUE(owner_id, seq) — mirrors the real schema constraint.
+      for (const r of tables.sealed_records.values()) {
+        if (r.owner_id === owner_id && r.seq === seq) {
+          throw new Error("UNIQUE constraint failed: sealed_records.owner_id, sealed_records.seq");
+        }
+      }
       tables.sealed_records.set(id, { id, owner_id, cid, envelope, seq, created_at, updated_at });
       return { success: true, meta: { changes: 1 } };
     }

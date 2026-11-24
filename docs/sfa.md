@@ -232,7 +232,7 @@ real D1 database (wrangler keeps the zero-UUID placeholder), **no
 ### 11.2 Auth — Awai identity `did:key` (`src/auth.js`, `src/worker.js`)
 
 ```text
-POST /auth/challenge {did}           -> 201 {did, nonce, purpose, timestamp, expiresAt} | 400 invalid-did | 429 rate-limited | 503 store-unavailable
+POST /auth/challenge {did}           -> 201 {did, nonce, purpose, timestamp, expiresAt} | 400 invalid-did | 429 rate-limited (AUTH_RATE_LIMIT binding) | 503 store-unavailable
 POST /auth/verify {did, nonce, signature} -> 200 {session, did, expiresAt} | 401 auth-failed | 503 store-unavailable
 ```
 
@@ -257,11 +257,18 @@ POST /auth/verify {did, nonce, signature} -> 200 {session, did, expiresAt} | 401
   (bad signature, wrong DID) burns the nonce too, and two parallel
   verifies of the same signature yield exactly one session. Expired
   challenges/sessions are deleted by a sweep on both the challenge and
-  verify paths. Unauthenticated challenge issuance is capped at
-  **10 active challenges per DID** and **1000 active globally**
-  (exceeding either answers **429**). NO `EIGYO_DB` binding → **503**
-  `store-unavailable` on all auth/records routes — the Worker never
-  falls back to memory storage. There is no Worker secret for key
+  verify paths; tables beyond **10,000 rows** are trimmed oldest-first
+  by the same sweep (growth is cleaned up, never rejected).
+  Unauthenticated challenge issuance is throttled by the
+  **`AUTH_RATE_LIMIT` Cloudflare Rate Limiting binding keyed by client
+  IP** (`wrangler.jsonc` `ratelimit`, config only — not deployed; the
+  IP is never stored in D1). DID-based issuance caps were **removed**:
+  a DID is public, so counting it would let a third party lock out its
+  owner (and disposable DIDs would lock out everyone). With the binding
+  present its decision is passed through as-is; with no binding the
+  Worker logs the absence and applies no limit. NO `EIGYO_DB` binding
+  → **503** `store-unavailable` on all auth/records routes — the Worker
+  never falls back to memory storage. There is no Worker secret for key
   material.
 - **Ed25519 choice:** WebCrypto only (`crypto.subtle` Ed25519
   importKey/sign/verify, ~0.05 ms/verify). The former pure-JS BigInt
@@ -286,9 +293,14 @@ POST /auth/verify {did, nonce, signature} -> 200 {session, did, expiresAt} | 401
 exactly:
 
 ```sql
-CREATE TABLE sealed_records (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, cid TEXT, envelope TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE sealed_records (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, cid TEXT, envelope TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(owner_id, seq));
 CREATE INDEX idx_sealed_owner ON sealed_records(owner_id);
 ```
+
+The `UNIQUE(owner_id, seq)` constraint is the backstop for the counter
+below: a colliding insert is **retried with a fresh allocation**
+(up to 3 attempts) instead of failing the write; a true duplicate id
+still answers 409.
 
 - Old `accounts`/`opportunities` tables are removed. The Worker uses
   `env.EIGYO_DB` for every auth and records operation; with no binding
@@ -301,9 +313,10 @@ CREATE INDEX idx_sealed_owner ON sealed_records(owner_id);
   (`owner_seq_counters`): one atomic upsert
   (`INSERT … ON CONFLICT(owner_id) DO UPDATE SET seq = seq + 1
   RETURNING seq`) hands out the value, so parallel same-owner writes
-  always receive distinct `seq`s. The optional client `seq` on
-  `POST /records` is validated for shape (integer ≥ 0) and otherwise
-  ignored — the server value is authoritative.
+  always receive distinct `seq`s; `UNIQUE(owner_id, seq)` plus
+  retry-on-collision covers a lagging counter. The optional client
+  `seq` on `POST /records` is validated for shape (integer ≥ 0) and
+  otherwise ignored — the server value is authoritative.
 - wrangler.jsonc keeps the zero-UUID placeholder. No real D1 database is
   created; `grep -c '"r2_buckets"' wrangler.jsonc` must print `0`.
 
@@ -361,12 +374,16 @@ The item-8 TODO is **done**: challenges/sessions moved from isolate-local
 `Map`s to D1 (`env.EIGYO_DB`) — hash-only (`nonce_hash`/`session_hash`
 = SHA-256 hex, 0 raw values in the DB), atomic single-use via
 `UPDATE … WHERE used = 0 AND expires_at > ?` with `meta.changes === 1`
-(a failed verify burns the nonce), expiry sweep on the
-challenge/verify paths, issuance caps (10 per DID / 1000 global →
-**429**), no binding → **503** (memory fallback deleted), and
-server-allocated per-owner `seq` via `owner_seq_counters`. Negative
-controls a–f for THIS store live in `test/d1-auth.test.js` (shared
-fake D1 in `test/fake-d1.js`); see §11.6.
+(a failed verify burns the nonce), expiry sweep + oldest-first trim
+beyond 10,000 rows on the challenge/verify paths, IP-keyed
+`AUTH_RATE_LIMIT` throttling (no DID caps — see §11.2), no binding →
+**503** (memory fallback deleted), and server-allocated per-owner
+`seq` via `owner_seq_counters` + `UNIQUE(owner_id, seq)` retry.
+Negative controls a–f for THIS store live in `test/d1-auth.test.js`
+(shared fake D1 in `test/fake-d1.js`); the real `schema.sql` is also
+executed under `node:sqlite` in `test/schema-sqlite.test.js` (the
+fake does not parse SQL, so this catches statement/schema typos the
+fake cannot).
 
 **Shared contract with kokyaku:** eigyo and kokyaku use the identical
 `sealed_records` schema (columns `id, owner_id, cid, envelope, seq,

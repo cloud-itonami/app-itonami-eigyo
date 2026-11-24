@@ -253,9 +253,14 @@ export function didToPubkey(did) {
 export const AUTH_PURPOSE = "eigyo:auth:login";
 export const NONCE_TTL_MS = 5 * 60 * 1000; // single-use, short-lived
 export const SESSION_TTL_MS = 5 * 60 * 1000; // short-lived, DID-bound (5 min, same as nonce)
-// Unauthenticated challenge issuance caps (exceeding either -> 429).
-export const MAX_ACTIVE_CHALLENGES_PER_DID = 10;
-export const MAX_ACTIVE_CHALLENGES_GLOBAL = 1000;
+// Table-size caps: when a table exceeds its cap the sweep deletes the
+// oldest rows (trim). Issuance is NEVER rejected for table size — DID
+// counting is deliberately not done here (a DID is public, so counting
+// it would let a third party lock out its owner). Issuance throttling
+// is the Cloudflare Rate Limiting binding keyed by client IP, applied
+// in src/worker.js — the IP is never stored in D1.
+export const MAX_CHALLENGE_ROWS = 10_000;
+export const MAX_SESSION_ROWS = 10_000;
 
 export function canonicalAuthMessage({ nonce, purpose, timestamp }) {
   return `${nonce}||${purpose}||${timestamp}`;
@@ -286,6 +291,16 @@ export function createAuthService({ now = () => Date.now(), cryptoImpl = globalT
 
   // Delete expired challenges/sessions. Runs on BOTH the challenge and
   // verify paths so expired rows cannot accumulate between requests.
+  async function trimTable(database, table, keyColumn, maxRows) {
+    const row = await database.prepare(`SELECT COUNT(*) AS n FROM ${table}`).bind().first();
+    const n = row && typeof row.n === "number" ? row.n : 0;
+    if (n > maxRows) {
+      await database.prepare(
+        `DELETE FROM ${table} WHERE ${keyColumn} IN (SELECT ${keyColumn} FROM ${table} ORDER BY created_at ASC LIMIT ?)`,
+      ).bind(n - maxRows).run();
+    }
+  }
+
   async function sweep(database, nowMs) {
     const statements = [
       database.prepare("DELETE FROM challenges WHERE expires_at <= ?").bind(nowMs),
@@ -296,6 +311,10 @@ export function createAuthService({ now = () => Date.now(), cryptoImpl = globalT
     } else {
       for (const stmt of statements) await stmt.run();
     }
+    // Growth beyond the row caps is handled by oldest-first trim here,
+    // never by rejecting new issuance.
+    await trimTable(database, "challenges", "nonce_hash", MAX_CHALLENGE_ROWS);
+    await trimTable(database, "sessions", "session_hash", MAX_SESSION_ROWS);
   }
 
   async function issueChallenge(did, dbOverride) {
@@ -311,18 +330,6 @@ export function createAuthService({ now = () => Date.now(), cryptoImpl = globalT
     const issuedAtMs = now();
     try {
       await sweep(database, issuedAtMs);
-      const perDid = await database.prepare(
-        "SELECT COUNT(*) AS n FROM challenges WHERE did = ? AND used = 0 AND expires_at > ?",
-      ).bind(did, issuedAtMs).first();
-      if (perDid && perDid.n >= MAX_ACTIVE_CHALLENGES_PER_DID) {
-        return { ok: false, error: "rate-limited" };
-      }
-      const global = await database.prepare(
-        "SELECT COUNT(*) AS n FROM challenges WHERE used = 0 AND expires_at > ?",
-      ).bind(issuedAtMs).first();
-      if (global && global.n >= MAX_ACTIVE_CHALLENGES_GLOBAL) {
-        return { ok: false, error: "rate-limited" };
-      }
     } catch {
       return { ok: false, error: "store-unavailable" };
     }

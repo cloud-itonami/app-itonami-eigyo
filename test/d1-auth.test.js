@@ -179,7 +179,7 @@ describe("D1 auth store — negative controls (a)-(f)", () => {
   });
 });
 
-describe("D1 auth store — single-use, caps, sweep, seq", () => {
+describe("D1 auth store — single-use, sweep, seq", () => {
   it("a failed signature burns the nonce (good signature afterwards still 401)", async () => {
     const db = createFakeD1();
     const idn = await identity();
@@ -199,29 +199,78 @@ describe("D1 auth store — single-use, caps, sweep, seq", () => {
     assert.equal(db._tables.sessions.size, 0);
   });
 
-  it("challenge issuance caps: per-DID max active -> 429", async () => {
+  it("no DID caps: third party issuing many challenges for the victim DID still lets the victim in", async () => {
     const db = createFakeD1();
-    const idn = await identity();
-    for (let i = 0; i < 10; i++) await doChallenge(db, idn.did);
-    const res = await fetchHandler(req("POST", "/auth/challenge", { did: idn.did }), { EIGYO_DB: db });
-    assert.equal(res.status, 429);
-    // A different DID is unaffected.
-    const other = await identity();
-    assert.equal((await fetchHandler(req("POST", "/auth/challenge", { did: other.did }), { EIGYO_DB: db })).status, 201);
+    const victim = await identity();
+    // 30 challenges issued for the victim DID (old per-DID cap was 10).
+    for (let i = 0; i < 30; i++) await doChallenge(db, victim.did);
+    // The victim can still obtain a fresh challenge and log in.
+    const challenge = await doChallenge(db, victim.did);
+    const signature = await signFor(victim.seed, challenge);
+    const res = await fetchHandler(
+      req("POST", "/auth/verify", { did: victim.did, nonce: challenge.nonce, signature }),
+      { EIGYO_DB: db },
+    );
+    assert.equal(res.status, 200);
   });
 
-  it("challenge issuance caps: global max active -> 429", async () => {
+  it("no global cap: 400 disposable-DID challenges do not block a new user", async () => {
     const db = createFakeD1();
     const now = Date.now();
-    for (let i = 0; i < 1000; i++) {
-      db._tables.challenges.set(`seed-${i}`, {
-        nonce_hash: `seed-${i}`, did: `did:key:zseed${i}`, purpose: "eigyo:auth:login",
-        timestamp: new Date(now).toISOString(), expires_at: now + 60_000, used: 0, created_at: now,
+    for (let i = 0; i < 400; i++) {
+      db._tables.challenges.set(`disposable-${i}`, {
+        nonce_hash: `disposable-${i}`, did: `did:key:zdisposable${i}`, purpose: "eigyo:auth:login",
+        timestamp: new Date(now).toISOString(), expires_at: now + 60_000, used: 0, created_at: now + i,
+      });
+    }
+    const fresh = await identity();
+    const challenge = await doChallenge(db, fresh.did);
+    assert.ok(challenge.nonce);
+    // The seeded rows are untouched by the new issuance (no rejection, no trim below cap).
+    assert.equal(db._tables.challenges.size, 401);
+  });
+
+  it("rate limit binding rejection passes through as 429 (Worker does not count DIDs)", async () => {
+    const db = createFakeD1();
+    const idn = await identity();
+    let seenKey = null;
+    const denying = { limit: async ({ key }) => { seenKey = key; return { success: false }; } };
+    const res = await fetchHandler(
+      new Request(base + "/auth/challenge", {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.7" },
+        body: JSON.stringify({ did: idn.did }),
+      }),
+      { EIGYO_DB: db, AUTH_RATE_LIMIT: denying },
+    );
+    assert.equal(res.status, 429);
+    assert.equal(seenKey, "203.0.113.7"); // keyed by client IP, never by DID
+    // An allowing binding lets the request through.
+    const allowing = { limit: async () => ({ success: true }) };
+    const ok = await fetchHandler(req("POST", "/auth/challenge", { did: idn.did }), { EIGYO_DB: db, AUTH_RATE_LIMIT: allowing });
+    assert.equal(ok.status, 201);
+  });
+
+  it("no rate limit binding: challenge issuance works without limits (absence is logged)", async () => {
+    const db = createFakeD1();
+    const idn = await identity();
+    const res = await fetchHandler(req("POST", "/auth/challenge", { did: idn.did }), { EIGYO_DB: db });
+    assert.equal(res.status, 201);
+  });
+
+  it("table trim: beyond 10,000 challenge rows the oldest are deleted, never rejected", async () => {
+    const db = createFakeD1();
+    const now = Date.now();
+    for (let i = 0; i < 10_001; i++) {
+      db._tables.challenges.set(`old-${i}`, {
+        nonce_hash: `old-${i}`, did: `did:key:zold${i}`, purpose: "eigyo:auth:login",
+        timestamp: new Date(now - 30_000).toISOString(), expires_at: now + 60_000, used: 0, created_at: now - 30_000 + i,
       });
     }
     const idn = await identity();
-    const res = await fetchHandler(req("POST", "/auth/challenge", { did: idn.did }), { EIGYO_DB: db });
-    assert.equal(res.status, 429);
+    await doChallenge(db, idn.did);
+    assert.ok(db._tables.challenges.size <= 10_001, `trimmed to cap, got ${db._tables.challenges.size}`);
+    assert.equal(db._tables.challenges.has("old-0"), false); // oldest first
   });
 
   it("expiry sweep: expired challenges/sessions are deleted on the challenge path", async () => {
@@ -255,6 +304,27 @@ describe("D1 auth store — single-use, caps, sweep, seq", () => {
     assert.notEqual(m1.seq, m2.seq);
     const rows = [...db._tables.sealed_records.values()];
     assert.equal(new Set(rows.map((r) => r.seq)).size, rows.length);
+  });
+
+  it("UNIQUE(owner_id, seq) collision is retried to a fresh seq (201, no duplicate)", async () => {
+    const db = createFakeD1();
+    const { did, session } = await makeSession(db);
+    // Simulate a counter that must catch up: a row already occupies seq 1
+    // while the counter still hands out 1 -> the first insert collides.
+    db._tables.sealed_records.set("seeded-seq-1", {
+      id: "seeded-seq-1", owner_id: did, cid: null, envelope: "{}", seq: 1,
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    });
+    db._tables.owner_seq_counters.set(did, { owner_id: did, seq: 0 });
+    const envelope = await sealPayload(synthetic, PASS);
+    const res = await fetchHandler(
+      req("POST", "/records", { envelope }, { did, session }),
+      { EIGYO_DB: db },
+    );
+    assert.equal(res.status, 201);
+    const meta = await json(res);
+    assert.equal(meta.seq, 2);
+    assert.equal(new Set([...db._tables.sealed_records.values()].map((r) => r.seq)).size, 2);
   });
 
   it("expired session in D1 -> 401 on protected route", async () => {
