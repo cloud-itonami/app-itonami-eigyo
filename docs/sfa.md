@@ -29,11 +29,12 @@ PRs #1–#3 touched only registry/docs (`MIGRATION-TODO.md`, `blueprint.edn`,
 | File | Role |
 |---|---|
 | `src/sfa.js` | Domain: accounts, opportunities (name/amount/**probability**/stage/account link/owner), stage transitions, by-stage + quarterly report, owner/member scoping |
+| `src/seal.js` | Client-side sealing: AES-256-GCM encrypt/decrypt of opportunity payloads (key injected, never in repo) |
 | `src/worker.js` | Plain-JS Worker: `/health`, yataverse proxy `GET /ipfs/<cid>`, account/opportunity/report routes |
 | `schema.sql` | D1 mirror (free tier; not applied) |
 | `wrangler.jsonc` | Worker config; D1 binding is a **zero-UUID placeholder (not created)**; **no `r2_buckets`** |
 | `package.json` | `test: node --test`, `build: node --check` |
-| `test/sfa.test.js`, `test/worker.test.js` | `node --test` suites (runnable without install) |
+| `test/sfa.test.js`, `test/worker.test.js`, `test/seal.test.js` | `node --test` suites (runnable without install) |
 
 The stage machine intentionally mirrors the kotoba convention (5 stages,
 `won`/`lost` terminal, unknown stage rejected) so the two layers agree;
@@ -113,7 +114,60 @@ GET  /report?role=&userId=&quarter=  {byStage, quarterly, scope}
 ## 9. Run / test
 
 ```sh
-npm test     # node --test — transitions, report, roles, yataverse proxy, R2 non-dependence
+npm test     # node --test — transitions, report, roles, yataverse proxy, R2 non-dependence, seal round-trip
 npm run build # node --check (no build artifacts)
 grep -c '"r2_buckets"' wrangler.jsonc   # must print 0
 ```
+
+## 10. Threat model & client-side sealing (暗号化）
+
+### 10.1 The threat: CID knowledge is enough to read
+
+`GET https://yataverse.com/ipfs/<cid>` returns the stored body verbatim
+with HTTP 200 — yataverse does **not** encrypt content. Anyone who knows
+a CID can read the object (public-by-knowledge-of-CID, same as IPFS).
+Therefore **unencrypted opportunity data on yataverse has no
+confidentiality at all** — a leaked CID, access log, or cache entry is a
+full data leak.
+
+### 10.2 The design: encrypt before `yataverse put`
+
+| step | where | what |
+|---|---|---|
+| 1. Seal | client (browser/app, `src/seal.js`) | AES-256-GCM (`WebCrypto`), random 12-byte IV, AAD `eigyo:opportunity:v1` |
+| 2. Put | `yataverse put` (CACAO admin key) | stores the JSON envelope `{v, alg, iv, data}` only |
+| 3. Fetch | anyone (`GET /ipfs/<cid>`) | receives ciphertext — unreadable without the key |
+| 4. Open | client (`openPayload`) | wrong key / tampered data → AES-GCM auth failure, no plaintext |
+
+```text
+opportunity ─▶ seal (client, AES-256-GCM) ─▶ envelope ─▶ yataverse put
+opportunity ◀─ open (client, key)      ◀─ GET /ipfs/<cid> (ciphertext only)
+```
+
+### 10.3 Key management (outside this dapp)
+
+- Keys are **injected parameters** (`newKey()` / `importKey(raw32)`); no
+  key material, password, or seed phrase exists in this repo (tests use
+  ephemeral keys generated at runtime).
+- Key custody/persistence (keychain, env store, HSM) is an ops decision
+  **outside this dapp's scope**. Losing the key = losing the data
+  (by design — confidentiality); envelope versioning (`v: 1`) exists for
+  future algorithm rotation.
+- `src/seal.js` is client-side code: the Worker never receives a key or
+  plaintext, and there is intentionally **no seal route** in `src/worker.js`.
+
+### 10.4 Sample-data policy (public repo)
+
+No real opportunity names, customer names, or amounts anywhere in this
+repo, docs, or PRs. All tests use synthetic payloads
+(`Synthetic Deal Alpha` / `Synthetic Co 000`).
+
+### 10.5 What sealing does NOT cover
+
+- **Metadata**: the CID, existence, and fetch pattern of an envelope are
+  still visible to yataverse nodes. Seal hides content, not existence.
+- **At-rest copies** on gateways/caches keep the ciphertext (safe), but
+  the *ability to fetch* is public — availability is not restricted.
+- The in-memory Worker store (skeleton) holds **plaintext**
+  opportunities at runtime; it is a local demo surface, not a data
+  store. Persisted ciphertext is the sealed envelope, never plaintext.

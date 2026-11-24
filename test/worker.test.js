@@ -122,7 +122,7 @@ describe("R2 non-dependence", () => {
   it("wrangler.jsonc carries no r2 bucket binding; sources never call R2", () => {
     const wrangler = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
     assert.equal(wrangler.includes('"r2_buckets"'), false);
-    for (const file of ["src/sfa.js", "src/worker.js"]) {
+    for (const file of ["src/sfa.js", "src/worker.js", "src/seal.js"]) {
       const code = stripComments(readFileSync(new URL(`../${file}`, import.meta.url), "utf8"));
       assert.equal(code.includes("R2."), false, `${file} must not reference R2.`);
       assert.equal(code.includes("r2_buckets"), false, `${file} must not reference r2_buckets`);
