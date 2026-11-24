@@ -1,0 +1,21 @@
+{
+  "name": "app-itonami-eigyo",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-04-01",
+  "workers_dev": true,
+  // Minimal SFA skeleton (accounts / opportunities / reports / role scope).
+  // Plain JS, zero dependencies: wrangler deploys src/worker.js directly;
+  // the build is just `node --check`.
+  //
+  // R2 NON-DEPENDENCE (owner policy 2026-11-23): this file intentionally has
+  // NO r2 bucket binding and src/worker.js never touches R2. Content read
+  // is GET https://yataverse.com/ipfs/<cid>, write is `yataverse put`
+  // (not exposed as a route in this skeleton). D1/KV/DO/secrets are allowed
+  // by the policy but are NOT created here — the D1 binding below is a
+  // free-tier placeholder (all-zero id; NOT created, mirrors schema.sql);
+  // the Worker runs on the in-memory store until D1 wiring lands.
+  // No paid resources.
+  "d1_databases": [
+    { "binding": "EIGYO_DB", "database_name": "app-itonami-eigyo", "database_id": "00000000-0000-0000-0000-000000000000" }
+  ]
+}
