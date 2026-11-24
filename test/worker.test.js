@@ -14,6 +14,13 @@ import {
   pubkeyToDid,
 } from "../src/auth.js";
 import { openPayload, rewrapPayload, sealPayload } from "../src/seal.js";
+import { createFakeD1 } from "./fake-d1.js";
+
+// Shared fake D1 for HTTP tests: challenge/session/record state lives in
+// D1 now, so every auth+records call in a test flow MUST pass this env
+// (previously calls passed {} and used the isolate-local memory stores).
+const sharedDb = createFakeD1();
+const env = { EIGYO_DB: sharedDb };
 
 // Synthetic data only — no real opportunity/customer data in this repo.
 const synthetic = {
@@ -47,10 +54,11 @@ async function json(res) {
 }
 
 // Full client flow: generate keypair -> challenge -> sign -> verify -> session.
-async function makeSession() {
+async function makeSession(db = sharedDb) {
   const { seed, publicKey } = await ed25519GenerateKeypair();
   const did = pubkeyToDid(publicKey);
-  const challengeRes = await fetchHandler(req("POST", "/auth/challenge", { did }), {});
+  const localEnv = { EIGYO_DB: db };
+  const challengeRes = await fetchHandler(req("POST", "/auth/challenge", { did }), localEnv);
   assert.equal(challengeRes.status, 201);
   const challenge = await json(challengeRes);
   const message = canonicalAuthMessage({
@@ -59,7 +67,7 @@ async function makeSession() {
     timestamp: challenge.timestamp,
   });
   const signature = Buffer.from(await ed25519Sign(seed, new TextEncoder().encode(message))).toString("base64");
-  const verifyRes = await fetchHandler(req("POST", "/auth/verify", { did, nonce: challenge.nonce, signature }), {});
+  const verifyRes = await fetchHandler(req("POST", "/auth/verify", { did, nonce: challenge.nonce, signature }), localEnv);
   assert.equal(verifyRes.status, 200);
   const verified = await json(verifyRes);
   assert.ok(verified.session);
@@ -138,11 +146,11 @@ describe("did:key", () => {
 describe("auth service (challenge/verify/session, unit)", () => {
   it("rejects nonce replay, expiry, and wrong signatures", async () => {
     let t = 1_000_000;
-    const auth = createAuthService({ now: () => t });
-    assert.deepEqual(auth.issueChallenge("did:key:z0").ok, false);
+    const auth = createAuthService({ now: () => t, db: createFakeD1() });
+    assert.deepEqual((await auth.issueChallenge("did:key:z0")).ok, false);
     const { seed, publicKey } = await ed25519GenerateKeypair();
     const did = pubkeyToDid(publicKey);
-    const c = auth.issueChallenge(did);
+    const c = await auth.issueChallenge(did);
     const msg = canonicalAuthMessage({ nonce: c.nonce, purpose: c.purpose, timestamp: c.timestamp });
     const good = Buffer.from(await ed25519Sign(seed, new TextEncoder().encode(msg))).toString("base64");
     const wrong = Buffer.from(await ed25519Sign(seed, new TextEncoder().encode("x||y||z"))).toString("base64");
@@ -157,7 +165,7 @@ describe("auth service (challenge/verify/session, unit)", () => {
     });
     // expired nonce -> auth-failed
     t = 1_000_000;
-    const c2 = auth.issueChallenge(did);
+    const c2 = await auth.issueChallenge(did);
     const msg2 = canonicalAuthMessage({ nonce: c2.nonce, purpose: c2.purpose, timestamp: c2.timestamp });
     const sig2 = Buffer.from(await ed25519Sign(seed, new TextEncoder().encode(msg2))).toString("base64");
     t += 5 * 60 * 1000 + 1;
@@ -167,41 +175,41 @@ describe("auth service (challenge/verify/session, unit)", () => {
     });
     // valid -> session -> expired session
     t = 1_000_000;
-    const c3 = auth.issueChallenge(did);
+    const c3 = await auth.issueChallenge(did);
     const msg3 = canonicalAuthMessage({ nonce: c3.nonce, purpose: c3.purpose, timestamp: c3.timestamp });
     const sig3 = Buffer.from(await ed25519Sign(seed, new TextEncoder().encode(msg3))).toString("base64");
     const verified = await auth.verifyResponse({ did, nonce: c3.nonce, signature: sig3 });
     assert.equal(verified.ok, true);
-    assert.equal(auth.getSession(verified.session, did), did);
-    assert.equal(auth.getSession(verified.session, "did:key:zOther"), null);
+    assert.equal(await auth.getSession(verified.session, did), did);
+    assert.equal(await auth.getSession(verified.session, "did:key:zOther"), null);
     t += 5 * 60 * 1000 + 1;
-    assert.equal(auth.getSession(verified.session, did), null);
+    assert.equal(await auth.getSession(verified.session, did), null);
   });
 });
 
 describe("worker http surface", () => {
   it("serves health with yataverse storage flag", async () => {
-    const res = await fetchHandler(req("GET", "/health"), {});
+    const res = await fetchHandler(req("GET", "/health"), env);
     assert.equal(res.status, 200);
     const body = await json(res);
     assert.deepEqual(body, { ok: true, service: "app-itonami-eigyo", storage: "yataverse", r2: false });
   });
 
   it("auth: challenge/verify over HTTP; bad did 400; bad sig 401; no session = 401", async () => {
-    const badDid = await fetchHandler(req("POST", "/auth/challenge", { did: "did:key:z0" }), {});
+    const badDid = await fetchHandler(req("POST", "/auth/challenge", { did: "did:key:z0" }), env);
     assert.equal(badDid.status, 400);
 
     const { seed, publicKey } = await ed25519GenerateKeypair();
     const did = pubkeyToDid(publicKey);
-    const ch = await json(await fetchHandler(req("POST", "/auth/challenge", { did }), {}));
+    const ch = await json(await fetchHandler(req("POST", "/auth/challenge", { did }), env));
     const wrongSig = Buffer.from(
       await ed25519Sign(seed, new TextEncoder().encode("nonce||purpose||timestamp")),
     ).toString("base64");
-    const wrong = await fetchHandler(req("POST", "/auth/verify", { did, nonce: ch.nonce, signature: wrongSig }), {});
+    const wrong = await fetchHandler(req("POST", "/auth/verify", { did, nonce: ch.nonce, signature: wrongSig }), env);
     assert.equal(wrong.status, 401);
     assert.deepEqual(await json(wrong), { error: "auth-failed" });
 
-    const meh = await fetchHandler(req("GET", "/records"), {});
+    const meh = await fetchHandler(req("GET", "/records"), env);
     assert.equal(meh.status, 401);
     assert.deepEqual(await json(meh), { error: "unauthorized" });
   });
@@ -212,7 +220,7 @@ describe("worker http surface", () => {
     const envelope = await sealPayload(synthetic, PASS);
     const created = await fetchHandler(
       req("POST", "/records", { id: "11111111-1111-4111-8111-111111111111", envelope, cid: "bafy-synthetic-cid", seq: 1 }, auth),
-      {},
+      env,
     );
     assert.equal(created.status, 201);
     const meta = await json(created);
@@ -221,12 +229,12 @@ describe("worker http surface", () => {
     assert.equal(meta.envelope, undefined); // metadata only
     assert.equal(JSON.stringify(meta).includes("Synthetic"), false);
 
-    const fetched = await fetchHandler(req("GET", "/records/11111111-1111-4111-8111-111111111111", undefined, auth), {});
+    const fetched = await fetchHandler(req("GET", "/records/11111111-1111-4111-8111-111111111111", undefined, auth), env);
     assert.equal(fetched.status, 200);
     const record = await json(fetched);
     assert.deepEqual(await openPayload(record.envelope, PASS), synthetic);
 
-    const listed = await fetchHandler(req("GET", "/records", undefined, auth), {});
+    const listed = await fetchHandler(req("GET", "/records", undefined, auth), env);
     const items = (await json(listed)).items;
     assert.ok(items.some((r) => r.id === "11111111-1111-4111-8111-111111111111"));
     assert.ok(items.every((r) => r.envelope === undefined)); // list never leaks envelopes
@@ -236,104 +244,64 @@ describe("worker http surface", () => {
     const a = await makeSession();
     const b = await makeSession();
     const envelope = await sealPayload(synthetic, PASS);
-    await fetchHandler(req("POST", "/records", { id: "22222222-2222-4222-8222-222222222222", envelope }, a), {});
+    await fetchHandler(req("POST", "/records", { id: "22222222-2222-4222-8222-222222222222", envelope }, a), env);
     // other owner -> 404 (existence not leaked), missing -> 404 never 500
-    assert.equal((await fetchHandler(req("GET", "/records/22222222-2222-4222-8222-222222222222", undefined, b), {})).status, 404);
-    const missing = await fetchHandler(req("GET", "/records/nope", undefined, a), {});
+    assert.equal((await fetchHandler(req("GET", "/records/22222222-2222-4222-8222-222222222222", undefined, b), env)).status, 404);
+    const missing = await fetchHandler(req("GET", "/records/nope", undefined, a), env);
     assert.equal(missing.status, 404);
     assert.notEqual(missing.status, 500);
     // bad envelope / bad cid / bad seq / duplicate
     assert.equal(
-      (await fetchHandler(req("POST", "/records", { envelope: { v: 2 } }, a), {})).status,
+      (await fetchHandler(req("POST", "/records", { envelope: { v: 2 } }, a), env)).status,
       400,
     );
     assert.equal(
-      (await fetchHandler(req("POST", "/records", { envelope, cid: "a/b" }, a), {})).status,
+      (await fetchHandler(req("POST", "/records", { envelope, cid: "a/b" }, a), env)).status,
       400,
     );
     assert.equal(
-      (await fetchHandler(req("POST", "/records", { envelope, seq: -1 }, a), {})).status,
+      (await fetchHandler(req("POST", "/records", { envelope, seq: -1 }, a), env)).status,
       400,
     );
     assert.equal(
-      (await fetchHandler(req("POST", "/records", { id: "22222222-2222-4222-8222-222222222222", envelope }, a), {})).status,
+      (await fetchHandler(req("POST", "/records", { id: "22222222-2222-4222-8222-222222222222", envelope }, a), env)).status,
       409,
     );
     assert.equal(
-      (await fetchHandler(req("POST", "/records", { envelope, cid: "bad cid" }, a), {})).status,
+      (await fetchHandler(req("POST", "/records", { envelope, cid: "bad cid" }, a), env)).status,
       400,
     );
   });
 
   it("plaintext routes are removed (server-side search/report gone by design)", async () => {
     const auth = await makeSession();
-    assert.equal((await fetchHandler(req("GET", "/opportunities", undefined, auth), {})).status, 404);
-    assert.equal((await fetchHandler(req("POST", "/opportunities", { name: "X" }, auth), {})).status, 404);
-    assert.equal((await fetchHandler(req("GET", "/report", undefined, auth), {})).status, 404);
-    assert.equal((await fetchHandler(req("GET", "/accounts", undefined, auth), {})).status, 404);
+    assert.equal((await fetchHandler(req("GET", "/opportunities", undefined, auth), env)).status, 404);
+    assert.equal((await fetchHandler(req("POST", "/opportunities", { name: "X" }, auth), env)).status, 404);
+    assert.equal((await fetchHandler(req("GET", "/report", undefined, auth), env)).status, 404);
+    assert.equal((await fetchHandler(req("GET", "/accounts", undefined, auth), env)).status, 404);
   });
 });
 
 describe("EIGYO_DB (D1) wiring via fake D1", () => {
-  function fakeD1() {
-    const rows = new Map();
-    return {
-      _rows: rows,
-      prepare(sql) {
-        return {
-          bind(...params) {
-            return {
-              async run() {
-                if (sql.includes("INSERT INTO sealed_records")) {
-                  const [id, owner_id, cid, envelope, seq, created_at, updated_at] = params;
-                  if (rows.has(id)) throw new Error("UNIQUE constraint failed: sealed_records.id");
-                  rows.set(id, { id, owner_id, cid, envelope, seq, created_at, updated_at });
-                  return { success: true };
-                }
-                throw new Error("unsupported sql");
-              },
-              async first() {
-                if (sql.includes("FROM sealed_records WHERE id = ?")) return rows.get(params[0]) ?? null;
-                throw new Error("unsupported sql");
-              },
-              async all() {
-                if (sql.includes("WHERE owner_id = ?")) {
-                  return {
-                    success: true,
-                    results: [...rows.values()]
-                      .filter((r) => r.owner_id === params[0])
-                      .sort((x, y) => x.seq - y.seq || String(x.created_at).localeCompare(String(y.created_at))),
-                  };
-                }
-                throw new Error("unsupported sql");
-              },
-            };
-          },
-        };
-      },
-    };
-  }
-
   it("stores/fetches sealed_records via env.EIGYO_DB (ciphertext only)", async () => {
-    const db = fakeD1();
-    const env = { EIGYO_DB: db };
-    const { did, session } = await makeSession();
+    const db = createFakeD1();
+    const localEnv = { EIGYO_DB: db };
+    const { did, session } = await makeSession(db);
     const auth = { did, session };
-    // auth calls use the shared in-memory auth service regardless of env
     const envelope = await sealPayload(synthetic, PASS);
-    const created = await fetchHandler(req("POST", "/records", { id: "33333333-3333-4333-8333-333333333333", envelope }, auth), env);
+    const created = await fetchHandler(req("POST", "/records", { id: "33333333-3333-4333-8333-333333333333", envelope }, auth), localEnv);
     assert.equal(created.status, 201);
-    const row = db._rows.get("33333333-3333-4333-8333-333333333333");
+    const row = db._tables.sealed_records.get("33333333-3333-4333-8333-333333333333");
     assert.ok(row);
     assert.equal(row.owner_id, did);
     const storedText = JSON.stringify(row);
     assert.equal(storedText.includes(synthetic.name), false);
     assert.equal(storedText.includes("Synthetic Co 000"), false);
 
-    const fetched = await fetchHandler(req("GET", "/records/33333333-3333-4333-8333-333333333333", undefined, auth), env);
+    const fetched = await fetchHandler(req("GET", "/records/33333333-3333-4333-8333-333333333333", undefined, auth), localEnv);
     assert.equal(fetched.status, 200);
     assert.deepEqual(await openPayload((await json(fetched)).envelope, PASS), synthetic);
-    const listed = await json(await fetchHandler(req("GET", "/records", undefined, auth), env));
+    const listed = await json(await fetchHandler(req("GET", "/records", undefined, auth), localEnv));
     assert.ok(listed.items.some((r) => r.id === "33333333-3333-4333-8333-333333333333"));
     assert.ok(listed.items.every((r) => r.envelope === undefined));
   });
@@ -343,21 +311,21 @@ describe("yataverse proxy (contracts preserved)", () => {
   it("streams upstream body with content-type; missing/error -> 404 never 500", async () => {
     const okFetch = async () =>
       new Response("blob-bytes", { status: 200, headers: { "content-type": "image/png" } });
-    const res = await fetchHandler(req("GET", "/ipfs/bafy-cid"), {}, okFetch);
+    const res = await fetchHandler(req("GET", "/ipfs/bafy-cid"), env, okFetch);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("content-type"), "image/png");
     assert.equal(res.headers.get("cache-control"), "public, max-age=300");
     assert.equal(await res.text(), "blob-bytes");
 
     const missingFetch = async () => new Response("nope", { status: 404 });
-    const missing = await fetchHandler(req("GET", "/ipfs/bafy-cid"), {}, missingFetch);
+    const missing = await fetchHandler(req("GET", "/ipfs/bafy-cid"), env, missingFetch);
     assert.equal(missing.status, 404);
     assert.notEqual(missing.status, 500);
 
     const throwFetch = async () => {
       throw new Error("network down");
     };
-    const unreachable = await fetchHandler(req("GET", "/ipfs/bafy-cid"), {}, throwFetch);
+    const unreachable = await fetchHandler(req("GET", "/ipfs/bafy-cid"), env, throwFetch);
     assert.equal(unreachable.status, 404);
     assert.notEqual(unreachable.status, 500);
   });
@@ -369,7 +337,7 @@ describe("yataverse proxy (contracts preserved)", () => {
       return new Response("x");
     };
     for (const bad of ["", "..x", "a%2Fb", "%5C", "a%20b", "b%00ad"]) {
-      const res = await fetchHandler(req("GET", `/ipfs/${bad}`), {}, spyFetch);
+      const res = await fetchHandler(req("GET", `/ipfs/${bad}`), env, spyFetch);
       assert.equal(res.status, 400, `expected 400 for CID ${bad}`);
     }
     assert.equal(fetched, false);
@@ -428,19 +396,19 @@ describe("review #1: server rejects plaintext / unknown keys / bad base64+length
         id: "Acme Corp deal",
         envelope: { v: 1, alg: "AES-256-GCM", iv: "x", data: "PLAINTEXT Acme", name: "PLAINTEXT extra" },
       }, auth),
-      {},
+      env,
     );
     assert.equal(res.status, 400);
     assert.equal((await json(res)).error, "bad-envelope");
-    assert.equal((await fetchHandler(req("GET", "/records/Acme%20Corp%20deal", undefined, auth), {})).status, 404);
+    assert.equal((await fetchHandler(req("GET", "/records/Acme%20Corp%20deal", undefined, auth), env)).status, 404);
   });
   it("rejects unknown envelope/wrappedKey/kdf keys and non-allowlisted body keys", async () => {
     const auth = await makeSession();
     const envelope = await sealPayload(synthetic, PASS);
-    assert.equal((await fetchHandler(req("POST", "/records", { envelope: { ...envelope, name: "PLAINTEXT extra" } }, auth), {})).status, 400);
-    assert.equal((await fetchHandler(req("POST", "/records", { envelope: { ...envelope, wrappedKey: { ...envelope.wrappedKey, extra: "x" } } }, auth), {})).status, 400);
-    assert.equal((await fetchHandler(req("POST", "/records", { envelope: { ...envelope, kdf: { ...envelope.kdf, extra: 1 } } }, auth), {})).status, 400);
-    assert.equal((await fetchHandler(req("POST", "/records", { envelope, name: "PLAINTEXT" }, auth), {})).status, 400);
+    assert.equal((await fetchHandler(req("POST", "/records", { envelope: { ...envelope, name: "PLAINTEXT extra" } }, auth), env)).status, 400);
+    assert.equal((await fetchHandler(req("POST", "/records", { envelope: { ...envelope, wrappedKey: { ...envelope.wrappedKey, extra: "x" } } }, auth), env)).status, 400);
+    assert.equal((await fetchHandler(req("POST", "/records", { envelope: { ...envelope, kdf: { ...envelope.kdf, extra: 1 } } }, auth), env)).status, 400);
+    assert.equal((await fetchHandler(req("POST", "/records", { envelope, name: "PLAINTEXT" }, auth), env)).status, 400);
   });
   it("rejects bad base64 and wrong field lengths (iv/salt/wrapped/data)", async () => {
     const auth = await makeSession();
@@ -454,19 +422,19 @@ describe("review #1: server rejects plaintext / unknown keys / bad base64+length
       { ...envelope, wrappedKey: { ...envelope.wrappedKey, data: b64(32) } },
       { ...envelope, kdf: { ...envelope.kdf, salt: b64(8) } },
     ];
-    for (const env of cases) {
-      assert.equal((await fetchHandler(req("POST", "/records", { envelope: env }, auth), {})).status, 400);
+    for (const envCase of cases) {
+      assert.equal((await fetchHandler(req("POST", "/records", { envelope: envCase }, auth), env)).status, 400);
     }
   });
   it("rejects ids that are neither server-issued (record_<32hex>) nor UUID", async () => {
     const auth = await makeSession();
     const envelope = await sealPayload(synthetic, PASS);
     for (const badId of ["Acme Corp deal", "record_alpha", "plain-id", "123"]) {
-      assert.equal((await fetchHandler(req("POST", "/records", { id: badId, envelope }, auth), {})).status, 400, `bad id ${badId}`);
+      assert.equal((await fetchHandler(req("POST", "/records", { id: badId, envelope }, auth), env)).status, 400, `bad id ${badId}`);
     }
-    assert.equal((await fetchHandler(req("POST", "/records", { id: `record_${"a".repeat(32)}`, envelope }, auth), {})).status, 201);
-    assert.equal((await fetchHandler(req("POST", "/records", { id: "44444444-4444-4444-8444-444444444444", envelope }, auth), {})).status, 201);
-    const generated = await fetchHandler(req("POST", "/records", { envelope }, auth), {});
+    assert.equal((await fetchHandler(req("POST", "/records", { id: `record_${"a".repeat(32)}`, envelope }, auth), env)).status, 201);
+    assert.equal((await fetchHandler(req("POST", "/records", { id: "44444444-4444-4444-8444-444444444444", envelope }, auth), env)).status, 201);
+    const generated = await fetchHandler(req("POST", "/records", { envelope }, auth), env);
     assert.equal(generated.status, 201);
     assert.match((await json(generated)).id, /^record_[0-9a-f]{32}$/);
   });
@@ -478,7 +446,7 @@ describe("review #2: POST /records accepts v2 only (v1 rejected)", () => {
     const auth = await makeSession();
     const v1 = await sealPayloadV1(synthetic, await newKey());
     assert.equal(v1.v, 1);
-    assert.equal((await fetchHandler(req("POST", "/records", { envelope: v1 }, auth), {})).status, 400);
+    assert.equal((await fetchHandler(req("POST", "/records", { envelope: v1 }, auth), env)).status, 400);
   });
 });
 
@@ -492,8 +460,8 @@ describe("review #3: KDF 600,000 + salt 16B enforced server-side", () => {
       { ...envelope, kdf: { ...envelope.kdf, iterations: 30000000 } },
       { ...envelope, kdf: { ...envelope.kdf, iterations: 599999 } },
     ];
-    for (const env of cases) {
-      assert.equal((await fetchHandler(req("POST", "/records", { envelope: env }, auth), {})).status, 400);
+    for (const envCase of cases) {
+      assert.equal((await fetchHandler(req("POST", "/records", { envelope: envCase }, auth), env)).status, 400);
     }
   });
 });
@@ -504,43 +472,62 @@ describe("review #5: no Bearer — x-did + x-session only", () => {
     const envelope = await sealPayload(synthetic, PASS);
     const headers = {};
     headers["authorization"] = "Bearer " + auth.session;
-    assert.equal((await fetchHandler(rawReq("POST", "/records", { envelope }, headers), {})).status, 401);
-    assert.equal((await fetchHandler(rawReq("GET", "/records", undefined, { "x-session": auth.session }), {})).status, 401);
-    assert.equal((await fetchHandler(rawReq("GET", "/records", undefined, { "x-did": auth.did }), {})).status, 401);
+    assert.equal((await fetchHandler(rawReq("POST", "/records", { envelope }, headers), env)).status, 401);
+    assert.equal((await fetchHandler(rawReq("GET", "/records", undefined, { "x-session": auth.session }), env)).status, 401);
+    assert.equal((await fetchHandler(rawReq("GET", "/records", undefined, { "x-did": auth.did }), env)).status, 401);
     const other = await makeSession();
-    assert.equal((await fetchHandler(req("GET", "/records", undefined, { did: other.did, session: auth.session }), {})).status, 401);
-    assert.equal((await fetchHandler(req("GET", "/records", undefined, auth), {})).status, 200);
+    assert.equal((await fetchHandler(req("GET", "/records", undefined, { did: other.did, session: auth.session }), env)).status, 401);
+    assert.equal((await fetchHandler(req("GET", "/records", undefined, auth), env)).status, 200);
   });
 });
 
 describe("review #6: D1 failure is 503, duplicate only on constraint violation", () => {
-  function failingD1(message) {
-    return { prepare() { return { bind() { return {
-      async run() { throw new Error(message); },
-      async first() { throw new Error(message); },
-      async all() { throw new Error(message); },
-    }; } }; } };
+  // Auth tables work (session lives there), only sealed_records writes fail —
+  // the single binding now serves both, so a blanket-failing stub could no
+  // longer distinguish a record-store failure from an auth failure.
+  function failingRecordsD1(message, baseDb) {
+    const inner = baseDb ?? createFakeD1();
+    return {
+      prepare(sql) {
+        const stmt = inner.prepare(sql);
+        return { bind(...params) {
+          const bound = stmt.bind(...params);
+          if (sql.includes("INSERT INTO sealed_records")) {
+            return {
+              async run() { throw new Error(message); },
+              async first() { throw new Error(message); },
+              async all() { throw new Error(message); },
+            };
+          }
+          return bound;
+        } };
+      },
+      batch: (stmts) => inner.batch(stmts),
+    };
   }
   it("maps a generic D1 error to 503 (not 409) and a constraint violation to 409", async () => {
-    const auth = await makeSession();
+    const db = createFakeD1();
+    const auth = await makeSession(db);
     const envelope = await sealPayload(synthetic, PASS);
-    const generic = await fetchHandler(req("POST", "/records", { envelope }, auth), { EIGYO_DB: failingD1("D1_ERROR: database is locked") });
+    const generic = await fetchHandler(req("POST", "/records", { envelope }, auth), { EIGYO_DB: failingRecordsD1("D1_ERROR: database is locked", db) });
     assert.equal(generic.status, 503);
     assert.deepEqual(await json(generic), { error: "store-unavailable" });
-    const constraint = await fetchHandler(req("POST", "/records", { envelope }, auth), { EIGYO_DB: failingD1("UNIQUE constraint failed: sealed_records.id") });
+    const constraint = await fetchHandler(req("POST", "/records", { envelope }, auth), { EIGYO_DB: failingRecordsD1("UNIQUE constraint failed: sealed_records.id", db) });
     assert.equal(constraint.status, 409);
-    assert.equal((await fetchHandler(req("GET", "/records", undefined, auth), { EIGYO_DB: failingD1("boom") })).status, 503);
-    assert.equal((await fetchHandler(req("GET", "/records/11111111-1111-4111-8111-111111111111", undefined, auth), { EIGYO_DB: failingD1("boom") })).status, 503);
+    // Reads against a fully-dead DB still map to 503 (session lookup fails).
+    const dead = { prepare() { throw new Error("boom"); } };
+    assert.equal((await fetchHandler(req("GET", "/records", undefined, auth), { EIGYO_DB: dead })).status, 503);
+    assert.equal((await fetchHandler(req("GET", "/records/11111111-1111-4111-8111-111111111111", undefined, auth), { EIGYO_DB: dead })).status, 503);
   });
 });
 
 describe("review #7: malformed %-encoding returns 400, never throws", () => {
   it("GET /records/%E0%A4 and GET /ipfs/%E0%A4 answer 400", async () => {
     const auth = await makeSession();
-    assert.equal((await fetchHandler(req("GET", "/records/%E0%A4", undefined, auth), {})).status, 400);
+    assert.equal((await fetchHandler(req("GET", "/records/%E0%A4", undefined, auth), env)).status, 400);
     let fetched = false;
     const spyFetch = async () => { fetched = true; return new Response("x"); };
-    assert.equal((await fetchHandler(req("GET", "/ipfs/%E0%A4"), {}, spyFetch)).status, 400);
+    assert.equal((await fetchHandler(req("GET", "/ipfs/%E0%A4"), env, spyFetch)).status, 400);
     assert.equal(fetched, false);
   });
 });

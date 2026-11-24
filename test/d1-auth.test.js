@@ -1,0 +1,267 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { fetchHandler } from "../src/worker.js";
+import {
+  canonicalAuthMessage,
+  ed25519GenerateKeypair,
+  ed25519Sign,
+  pubkeyToDid,
+} from "../src/auth.js";
+import { sealPayload } from "../src/seal.js";
+import { createFakeD1 } from "./fake-d1.js";
+
+// Synthetic data only.
+const synthetic = {
+  name: "Synthetic Deal Alpha",
+  amount: 12345,
+  probability: 60,
+  stage: "negotiation",
+  account: "Synthetic Co 000",
+};
+const PASS = "synthetic-d1-auth-test-passphrase";
+const base = "http://localhost";
+const req = (method, path, body, auth) =>
+  new Request(base + path, {
+    method,
+    headers: {
+      "content-type": "application/json",
+      ...(auth ? { "x-did": auth.did, "x-session": auth.session } : {}),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+const json = (res) => res.json();
+
+async function identity() {
+  const { seed, publicKey } = await ed25519GenerateKeypair();
+  return { seed, did: pubkeyToDid(publicKey) };
+}
+async function signFor(seed, challenge) {
+  const msg = canonicalAuthMessage({
+    nonce: challenge.nonce,
+    purpose: challenge.purpose,
+    timestamp: challenge.timestamp,
+  });
+  return Buffer.from(await ed25519Sign(seed, new TextEncoder().encode(msg))).toString("base64");
+}
+async function doChallenge(db, did) {
+  const res = await fetchHandler(req("POST", "/auth/challenge", { did }), { EIGYO_DB: db });
+  assert.equal(res.status, 201, `challenge for ${did} should be 201`);
+  return json(res);
+}
+async function makeSession(db) {
+  const idn = await identity();
+  const challenge = await doChallenge(db, idn.did);
+  const signature = await signFor(idn.seed, challenge);
+  const res = await fetchHandler(
+    req("POST", "/auth/verify", { did: idn.did, nonce: challenge.nonce, signature }),
+    { EIGYO_DB: db },
+  );
+  assert.equal(res.status, 200);
+  const verified = await json(res);
+  return { ...idn, session: verified.session, env: { EIGYO_DB: db } };
+}
+async function sha256Hex(text) {
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+describe("D1 auth store — negative controls (a)-(f)", () => {
+  it("negative control a: two Worker instances, same signature in parallel -> exactly 1 session", async () => {
+    const db = createFakeD1();
+    const idn = await identity();
+    const challenge = await doChallenge(db, idn.did);
+    const signature = await signFor(idn.seed, challenge);
+    const body = { did: idn.did, nonce: challenge.nonce, signature };
+    const [r1, r2] = await Promise.all([
+      fetchHandler(req("POST", "/auth/verify", body), { EIGYO_DB: db }),
+      fetchHandler(req("POST", "/auth/verify", body), { EIGYO_DB: db }),
+    ]);
+    const statuses = [r1.status, r2.status].sort();
+    assert.deepEqual(statuses, [200, 401]);
+    assert.equal(db._tables.sessions.size, 1);
+    const okRes = r1.status === 200 ? r1 : r2;
+    assert.ok((await json(okRes)).session);
+  });
+
+  it("negative control b: expired nonce -> rejected (401)", async () => {
+    const db = createFakeD1();
+    const idn = await identity();
+    const challenge = await doChallenge(db, idn.did);
+    const signature = await signFor(idn.seed, challenge);
+    // Force the stored challenge past its expiry.
+    for (const row of db._tables.challenges.values()) row.expires_at = Date.now() - 1;
+    const res = await fetchHandler(
+      req("POST", "/auth/verify", { did: idn.did, nonce: challenge.nonce, signature }),
+      { EIGYO_DB: db },
+    );
+    assert.equal(res.status, 401);
+    assert.equal(db._tables.sessions.size, 0);
+  });
+
+  it("negative control c: wrong DID -> rejected (401) and nonce burned", async () => {
+    const db = createFakeD1();
+    const a = await identity();
+    const b = await identity();
+    const challenge = await doChallenge(db, a.did);
+    const signatureB = await signFor(b.seed, challenge);
+    const res = await fetchHandler(
+      req("POST", "/auth/verify", { did: b.did, nonce: challenge.nonce, signature: signatureB }),
+      { EIGYO_DB: db },
+    );
+    assert.equal(res.status, 401);
+    // Even the rightful DID can no longer use the burned nonce.
+    const signatureA = await signFor(a.seed, challenge);
+    const retry = await fetchHandler(
+      req("POST", "/auth/verify", { did: a.did, nonce: challenge.nonce, signature: signatureA }),
+      { EIGYO_DB: db },
+    );
+    assert.equal(retry.status, 401);
+    assert.equal(db._tables.sessions.size, 0);
+  });
+
+  it("negative control d: no EIGYO_DB binding -> 503 (challenge/verify/records), never memory fallback", async () => {
+    const ch = await fetchHandler(req("POST", "/auth/challenge", { did: "did:key:z0" }), {});
+    assert.equal(ch.status, 503);
+    assert.deepEqual(await json(ch), { error: "store-unavailable" });
+    const vf = await fetchHandler(req("POST", "/auth/verify", { did: "x", nonce: "y", signature: "z" }), {});
+    assert.equal(vf.status, 503);
+    const rec = await fetchHandler(
+      req("POST", "/records", { envelope: { v: 2 } }, { did: "x", session: "y" }),
+      {},
+    );
+    assert.equal(rec.status, 503);
+    const list = await fetchHandler(req("GET", "/records", undefined, { did: "x", session: "y" }), {});
+    assert.equal(list.status, 503);
+    const one = await fetchHandler(req("GET", "/records/someid", undefined, { did: "x", session: "y" }), {});
+    assert.equal(one.status, 503);
+    // Public routes need no binding.
+    assert.equal((await fetchHandler(req("GET", "/health"), {})).status, 200);
+  });
+
+  it("negative control e: DB contains 0 raw nonce/session values (hash-only proof)", async () => {
+    const db = createFakeD1();
+    const idn = await identity();
+    const challenge = await doChallenge(db, idn.did);
+    const signature = await signFor(idn.seed, challenge);
+    const res = await fetchHandler(
+      req("POST", "/auth/verify", { did: idn.did, nonce: challenge.nonce, signature }),
+      { EIGYO_DB: db },
+    );
+    assert.equal(res.status, 200);
+    const { session } = await json(res);
+    const dump = db._dump();
+    assert.equal(dump.includes(challenge.nonce), false, "raw nonce must not be in DB");
+    assert.equal(dump.includes(session), false, "raw session must not be in DB");
+    assert.ok(dump.includes(await sha256Hex(challenge.nonce)), "nonce_hash stored");
+    assert.ok(dump.includes(await sha256Hex(session)), "session_hash stored");
+    for (const row of db._tables.challenges.values()) {
+      assert.deepEqual(Object.keys(row).sort(), ["created_at", "did", "expires_at", "nonce_hash", "purpose", "timestamp", "used"]);
+    }
+    for (const row of db._tables.sessions.values()) {
+      assert.deepEqual(Object.keys(row).sort(), ["created_at", "did", "expires_at", "session_hash"]);
+    }
+  });
+
+  it("negative control f: DB contains 0 plaintext payload fields (envelope ciphertext only)", async () => {
+    const db = createFakeD1();
+    const { did, session } = await makeSession(db);
+    const envelope = await sealPayload(synthetic, PASS);
+    const res = await fetchHandler(
+      req("POST", "/records", { envelope, cid: "bafy-synthetic-cid" }, { did, session }),
+      { EIGYO_DB: db },
+    );
+    assert.equal(res.status, 201);
+    const dump = db._dump();
+    assert.equal(dump.includes(synthetic.name), false);
+    assert.equal(dump.includes(synthetic.account), false);
+    const row = [...db._tables.sealed_records.values()][0];
+    assert.deepEqual(Object.keys(row).sort(), ["cid", "created_at", "envelope", "id", "owner_id", "seq", "updated_at"]);
+  });
+});
+
+describe("D1 auth store — single-use, caps, sweep, seq", () => {
+  it("a failed signature burns the nonce (good signature afterwards still 401)", async () => {
+    const db = createFakeD1();
+    const idn = await identity();
+    const challenge = await doChallenge(db, idn.did);
+    const bad = Buffer.from(await ed25519Sign(idn.seed, new TextEncoder().encode("x||y||z"))).toString("base64");
+    const first = await fetchHandler(
+      req("POST", "/auth/verify", { did: idn.did, nonce: challenge.nonce, signature: bad }),
+      { EIGYO_DB: db },
+    );
+    assert.equal(first.status, 401);
+    const good = await signFor(idn.seed, challenge);
+    const second = await fetchHandler(
+      req("POST", "/auth/verify", { did: idn.did, nonce: challenge.nonce, signature: good }),
+      { EIGYO_DB: db },
+    );
+    assert.equal(second.status, 401);
+    assert.equal(db._tables.sessions.size, 0);
+  });
+
+  it("challenge issuance caps: per-DID max active -> 429", async () => {
+    const db = createFakeD1();
+    const idn = await identity();
+    for (let i = 0; i < 10; i++) await doChallenge(db, idn.did);
+    const res = await fetchHandler(req("POST", "/auth/challenge", { did: idn.did }), { EIGYO_DB: db });
+    assert.equal(res.status, 429);
+    // A different DID is unaffected.
+    const other = await identity();
+    assert.equal((await fetchHandler(req("POST", "/auth/challenge", { did: other.did }), { EIGYO_DB: db })).status, 201);
+  });
+
+  it("challenge issuance caps: global max active -> 429", async () => {
+    const db = createFakeD1();
+    const now = Date.now();
+    for (let i = 0; i < 1000; i++) {
+      db._tables.challenges.set(`seed-${i}`, {
+        nonce_hash: `seed-${i}`, did: `did:key:zseed${i}`, purpose: "eigyo:auth:login",
+        timestamp: new Date(now).toISOString(), expires_at: now + 60_000, used: 0, created_at: now,
+      });
+    }
+    const idn = await identity();
+    const res = await fetchHandler(req("POST", "/auth/challenge", { did: idn.did }), { EIGYO_DB: db });
+    assert.equal(res.status, 429);
+  });
+
+  it("expiry sweep: expired challenges/sessions are deleted on the challenge path", async () => {
+    const db = createFakeD1();
+    const now = Date.now();
+    db._tables.challenges.set("expired-1", {
+      nonce_hash: "expired-1", did: "did:key:zold", purpose: "eigyo:auth:login",
+      timestamp: new Date(now - 600_000).toISOString(), expires_at: now - 1, used: 0, created_at: now - 600_000,
+    });
+    db._tables.sessions.set("expired-2", { session_hash: "expired-2", did: "did:key:zold", expires_at: now - 1, created_at: now - 600_000 });
+    const idn = await identity();
+    await doChallenge(db, idn.did);
+    assert.equal(db._tables.challenges.has("expired-1"), false);
+    assert.equal(db._tables.sessions.has("expired-2"), false);
+  });
+
+  it("parallel same-owner record writes get distinct server-allocated seqs", async () => {
+    const db = createFakeD1();
+    const { did, session } = await makeSession(db);
+    const auth = { did, session };
+    const e1 = await sealPayload(synthetic, PASS);
+    const e2 = await sealPayload({ ...synthetic, name: "Synthetic Deal Beta" }, PASS);
+    const [r1, r2] = await Promise.all([
+      fetchHandler(req("POST", "/records", { envelope: e1 }, auth), { EIGYO_DB: db }),
+      fetchHandler(req("POST", "/records", { envelope: e2 }, auth), { EIGYO_DB: db }),
+    ]);
+    assert.equal(r1.status, 201);
+    assert.equal(r2.status, 201);
+    const m1 = await json(r1);
+    const m2 = await json(r2);
+    assert.notEqual(m1.seq, m2.seq);
+    const rows = [...db._tables.sealed_records.values()];
+    assert.equal(new Set(rows.map((r) => r.seq)).size, rows.length);
+  });
+
+  it("expired session in D1 -> 401 on protected route", async () => {
+    const db = createFakeD1();
+    const { did, session } = await makeSession(db);
+    for (const row of db._tables.sessions.values()) row.expires_at = Date.now() - 1;
+    const res = await fetchHandler(req("GET", "/records", undefined, { did, session }), { EIGYO_DB: db });
+    assert.equal(res.status, 401);
+  });
+});
