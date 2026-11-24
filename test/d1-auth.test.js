@@ -251,6 +251,38 @@ describe("D1 auth store — single-use, sweep, seq", () => {
     assert.equal(ok.status, 201);
   });
 
+  it("x-forwarded-for alone is not used as the rate-limit key (binding not called without cf-connecting-ip)", async () => {
+    const db = createFakeD1();
+    const idn = await identity();
+    let calls = 0;
+    const spy = { limit: async () => { calls++; return { success: true }; } };
+    const res = await fetchHandler(
+      new Request(base + "/auth/challenge", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": "198.51.100.9" },
+        body: JSON.stringify({ did: idn.did }),
+      }),
+      { EIGYO_DB: db, AUTH_RATE_LIMIT: spy },
+    );
+    assert.equal(res.status, 201); // no cf-connecting-ip -> no limit, issuance proceeds
+    assert.equal(calls, 0); // x-forwarded-for is spoofable: never used as key
+  });
+
+  it("under the row cap, trim deletes nothing", async () => {
+    const db = createFakeD1();
+    const now = Date.now();
+    for (let i = 0; i < 5; i++) {
+      db._tables.challenges.set(`keep-${i}`, {
+        nonce_hash: `keep-${i}`, did: `did:key:zkeep${i}`, purpose: "eigyo:auth:login",
+        timestamp: new Date(now).toISOString(), expires_at: now + 60_000, used: 0, created_at: now + i,
+      });
+    }
+    const idn = await identity();
+    await doChallenge(db, idn.did);
+    for (let i = 0; i < 5; i++) assert.ok(db._tables.challenges.has(`keep-${i}`), `keep-${i} must survive`);
+    assert.equal(db._tables.challenges.size, 6);
+  });
+
   it("no rate limit binding: challenge issuance works without limits (absence is logged)", async () => {
     const db = createFakeD1();
     const idn = await identity();

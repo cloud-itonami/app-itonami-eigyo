@@ -312,7 +312,11 @@ export function createAuthService({ now = () => Date.now(), cryptoImpl = globalT
       for (const stmt of statements) await stmt.run();
     }
     // Growth beyond the row caps is handled by oldest-first trim here,
-    // never by rejecting new issuance.
+    // never by rejecting new issuance. The count check gates the delete
+    // (under the cap, trim does nothing), and the created_at indexes
+    // (idx_challenges_created_at / idx_sessions_created_at) back both
+    // the count and the ORDER BY created_at delete, so issuance never
+    // needs a full table scan to decide.
     await trimTable(database, "challenges", "nonce_hash", MAX_CHALLENGE_ROWS);
     await trimTable(database, "sessions", "session_hash", MAX_SESSION_ROWS);
   }

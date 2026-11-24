@@ -8,7 +8,9 @@ CREATE INDEX idx_sealed_owner ON sealed_records(owner_id);
 -- Auth: hash-only. Raw nonce/session values are NEVER stored, only SHA-256 hex.
 CREATE TABLE challenges (nonce_hash TEXT PRIMARY KEY, did TEXT NOT NULL, purpose TEXT NOT NULL, timestamp TEXT NOT NULL, expires_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
 CREATE INDEX idx_challenges_did_expires ON challenges(did, expires_at);
+CREATE INDEX idx_challenges_created_at ON challenges(created_at);
 CREATE TABLE sessions (session_hash TEXT PRIMARY KEY, did TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL);
 CREATE INDEX idx_sessions_did ON sessions(did);
+CREATE INDEX idx_sessions_created_at ON sessions(created_at);
 -- Per-owner monotonic seq counter (atomic upsert + RETURNING in the Worker).
 CREATE TABLE owner_seq_counters (owner_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);

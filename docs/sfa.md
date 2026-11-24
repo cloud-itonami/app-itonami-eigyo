@@ -262,7 +262,10 @@ POST /auth/verify {did, nonce, signature} -> 200 {session, did, expiresAt} | 401
   Unauthenticated challenge issuance is throttled by the
   **`AUTH_RATE_LIMIT` Cloudflare Rate Limiting binding keyed by client
   IP** (`wrangler.jsonc` `ratelimit`, config only — not deployed; the
-  IP is never stored in D1). DID-based issuance caps were **removed**:
+  IP is never stored in D1). The key is **`cf-connecting-ip` only** —
+  `x-forwarded-for` is spoofable and is never used; with no
+  `cf-connecting-ip` the binding is not called at all (no limit,
+  logged). DID-based issuance caps were **removed**:
   a DID is public, so counting it would let a third party lock out its
   owner (and disposable DIDs would lock out everyone). With the binding
   present its decision is passed through as-is; with no binding the

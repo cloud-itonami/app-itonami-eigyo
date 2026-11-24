@@ -78,6 +78,12 @@ describe("real schema (node:sqlite) — Worker SQL executes against schema.sql",
     const res = await fetchHandler(req("POST", "/records", { envelope }, auth), env);
     assert.equal(res.status, 201);
     assert.equal((await res.json()).seq, 2);
+    // created_at indexes back the trim's oldest-first ordering.
+    const idx = db._db.prepare(
+      "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index'",
+    ).all().map((r) => `${r.tbl_name}:${r.name}:${r.sql}`);
+    assert.ok(idx.some((i) => i.startsWith("challenges:") && i.includes("created_at")), idx.join(" | "));
+    assert.ok(idx.some((i) => i.startsWith("sessions:") && i.includes("created_at")), idx.join(" | "));
     // The schema really carries the UNIQUE(owner_id, seq) constraint.
     const cols = db._db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='sealed_records'").get();
     assert.ok(cols.sql.includes("UNIQUE(owner_id, seq)"), cols.sql);

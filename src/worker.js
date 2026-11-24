@@ -292,23 +292,26 @@ export async function fetchHandler(request, env, fetchImpl = fetch) {
   if (request.method === "POST" && path === "/auth/challenge") {
     if (!env?.EIGYO_DB) return json({ error: "store-unavailable" }, 503);
     // Issuance throttling: Cloudflare Rate Limiting binding keyed by
-    // client IP (the IP is never stored in D1). When the binding exists
-    // its decision is passed through as-is — the Worker never counts
-    // DIDs or builds its own 429. Without the binding there is no limit
-    // (that absence is logged, not silently skipped).
+    // client IP (the IP is never stored in D1). The key is
+    // cf-connecting-ip ONLY — x-forwarded-for is spoofable and is never
+    // used. With no cf-connecting-ip the binding is not called at all
+    // (no limit, logged). When the binding exists its decision is
+    // passed through as-is — the Worker never counts DIDs or builds
+    // its own 429. Without the binding there is no limit either (that
+    // absence is logged, not silently skipped).
     const rateLimit = env?.AUTH_RATE_LIMIT;
-    if (rateLimit) {
-      const ip = request.headers?.get("cf-connecting-ip") ||
-        request.headers?.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-        "unknown";
+    const clientIp = request.headers?.get("cf-connecting-ip") || "";
+    if (rateLimit && clientIp) {
       let decision;
       try {
-        decision = await rateLimit.limit({ key: ip });
+        decision = await rateLimit.limit({ key: clientIp });
       } catch {
         decision = null; // a broken limiter must not lock out issuance
       }
       if (decision instanceof Response) return decision;
       if (decision && decision.success === false) return json({ error: "rate-limited" }, 429);
+    } else if (rateLimit) {
+      console.warn("[eigyo] cf-connecting-ip absent; challenge issuance is not rate limited (x-forwarded-for is never trusted)");
     } else {
       console.warn("[eigyo] AUTH_RATE_LIMIT binding absent; challenge issuance is not rate limited");
     }
